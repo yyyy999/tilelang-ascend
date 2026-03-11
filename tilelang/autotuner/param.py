@@ -226,6 +226,7 @@ class AutotuneResult:
                 "symbolic": kernel.symbolic,
                 "params": kernel.params,
                 "out_idx": kernel.out_idx,
+                "param_info": kernel.param_info,
                 "signature": kernel.signature,    
                 "primfunc": kernel.prim_func,
                 "mlir_content": kernel.mlir_content,
