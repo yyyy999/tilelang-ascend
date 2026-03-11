@@ -1,8 +1,8 @@
 """
-验证动态shape kernel的离线加载功能
+验证动态shape kernel的离线加载功能 - 使用GEMM
 
 验证步骤：
-1. 编译一个使用T.symbolic()的动态shape kernel
+1. 编译一个使用T.symbolic()的动态shape GEMM kernel
 2. 保存kernel到磁盘
 3. 从磁盘加载kernel
 4. 用不同的shape调用，验证是否能正常工作
@@ -17,6 +17,7 @@ from tilelang.jit.jit_npu import JitKernel_NPU
 import cloudpickle
 
 torch.npu.set_device(0)
+tilelang.cache.clear_cache()
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "test_cache")
 
@@ -25,49 +26,53 @@ def cleanup_cache():
         shutil.rmtree(CACHE_DIR)
     os.makedirs(CACHE_DIR)
 
-def compile_dynamic_kernel():
-    """编译动态shape的kernel"""
+def compile_dynamic_gemm_kernel():
+    """编译动态shape的GEMM kernel"""
     print("=" * 50)
-    print("Step 1: 编译动态shape kernel")
+    print("Step 1: 编译动态shape GEMM kernel")
     print("=" * 50)
     
     @tilelang.jit(target="npuir")
-    def vec_add_dynamic(block_M=128, block_N=128, dtype="float16"):
+    def matmul_dynamic(block_M=128, block_N=256, K_L1=16, dtype="float16", accum_dtype="float32"):
         M = T.symbolic("M")
         N = T.symbolic("N")
-        
+        K = T.symbolic("K")
+
         @T.prim_func
         def main(
-            A: T.Tensor((M, N), dtype),
-            B: T.Tensor((M, N), dtype),
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
             C: T.Tensor((M, N), dtype)
         ):
             with T.Kernel(T.ceildiv(M, block_M) * T.ceildiv(N, block_N), is_npu=True) as (cid, _):
-                A_VEC = T.alloc_ub((block_M, block_N), dtype)
-                B_VEC = T.alloc_ub((block_M, block_N), dtype)
-                C_VEC = T.alloc_ub((block_M, block_N), dtype)
-                
-                m_num = T.ceildiv(M, block_M)
-                n_num = T.ceildiv(N, block_N)
-                
-                start_block_id = cid * T.ceildiv(m_num * n_num, 1)
-                for i in T.serial(T.ceildiv(m_num * n_num, 1)):
-                    block_id = start_block_id + i
-                    if block_id < m_num * n_num:
-                        block_id_m = block_id // n_num
-                        block_id_n = block_id % n_num
-                        bx = block_id_m * block_M
-                        by = block_id_n * block_N
-                        remain_M = T.min(M - bx, block_M)
-                        remain_N = T.min(N - by, block_N)
-                        T.copy(A[bx:bx+remain_M, by:by+remain_N], A_VEC)
-                        T.copy(B[bx:bx+remain_M, by:by+remain_N], B_VEC)
-                        T.vadd(A_VEC, B_VEC, C_VEC)
-                        T.copy(C_VEC, C[bx:bx+remain_M, by:by+remain_N])
-        
+                with T.Scope("Cube"):
+                    bx = cid // T.ceildiv(N, block_N) * block_M
+                    by = cid % T.ceildiv(N, block_N) * block_N
+                    A_BUF = T.alloc_L1([block_M, K_L1], dtype)
+                    B_BUF = T.alloc_L1([K_L1, block_N], dtype)
+                    C_BUF = T.alloc_L0C([block_M, block_N], accum_dtype)
+
+                    remain_M = T.min(M - bx, block_M)
+                    remain_N = T.min(N - by, block_N)
+
+                    for i in T.serial(T.ceildiv(K, K_L1)):
+                        remain_K = T.min(K - i * K_L1, K_L1)
+                        T.load_nd2nz(A[bx, i * K_L1], A_BUF, [remain_M, remain_K])
+                        T.load_nd2nz(B[i * K_L1, by], B_BUF, [remain_K, remain_N])
+
+                        if i == 0:
+                            T.gemm(A_BUF, B_BUF, C_BUF, initC=True, b_transpose=False,
+                                size=[remain_M, remain_K, remain_N])
+                        else:
+                            T.gemm(A_BUF, B_BUF, C_BUF, initC=False, b_transpose=False,
+                                size=[remain_M, remain_K, remain_N])
+
+                        T.store_fixpipe(C_BUF, C[bx, by],
+                            size=[remain_M, remain_N], enable_nz2nd=True)
+
         return main
     
-    kernel = vec_add_dynamic()
+    kernel = matmul_dynamic()
     print(f"Kernel编译完成")
     print(f"  - symbolic: {kernel.symbolic}")
     print(f"  - param_info: {kernel.param_info}")
@@ -111,7 +116,9 @@ def save_kernel_to_disk(kernel):
     
     print(f"\n保存的metadata内容:")
     print(f"  - symbolic: {metadata['symbolic']}")
-    print(f"  - param_info: {metadata['param_info']}")
+    print(f"  - param_info 长度: {len(metadata['param_info'])}")
+    for i, info in enumerate(metadata['param_info']):
+        print(f"    [{i}] dtype={info['dtype']}, shape={info['shape']}, is_output={info['is_output']}")
 
 def load_kernel_from_disk():
     """从磁盘加载kernel"""
@@ -125,7 +132,9 @@ def load_kernel_from_disk():
     
     print(f"加载的metadata内容:")
     print(f"  - symbolic: {metadata['symbolic']}")
-    print(f"  - param_info: {metadata['param_info']}")
+    print(f"  - param_info 长度: {len(metadata['param_info'])}")
+    for i, info in enumerate(metadata['param_info']):
+        print(f"    [{i}] dtype={info['dtype']}, shape={info['shape']}, is_output={info['is_output']}")
     
     kernel = JitKernel_NPU.from_database(
         mod=metadata["primfunc"],
@@ -138,7 +147,7 @@ def load_kernel_from_disk():
     
     print(f"\nKernel加载完成")
     print(f"  - symbolic: {kernel.symbolic}")
-    print(f"  - param_info: {kernel.param_info}")
+    print(f"  - param_info 长度: {len(kernel.param_info)}")
     
     return kernel
 
@@ -149,24 +158,24 @@ def test_dynamic_shapes(kernel):
     print("=" * 50)
     
     test_cases = [
-        (256, 256),
-        (512, 512),
-        (1024, 256),
-        (256, 1024),
+        (1024, 512, 2048),
+        (512, 1024, 512),
+        (512, 512, 1264),
     ]
     
-    for M, N in test_cases:
-        print(f"\n测试 shape: ({M}, {N})")
+    for M, N, K in test_cases:
+        print(f"\n测试 shape: M={M}, N={N}, K={K}")
         
-        a = torch.randn(M, N, dtype=torch.float16, device="npu")
-        b = torch.randn(M, N, dtype=torch.float16, device="npu")
+        a = torch.randn(M, K, dtype=torch.float16, device="npu")
+        b = torch.randn(K, N, dtype=torch.float16, device="npu")
+        c = torch.randn(M, N, dtype=torch.float16, device="npu")
         
-        result = kernel(a, b)
+        kernel(a, b, c)
         
-        expected = a + b
+        ref_c = a @ b
         
         try:
-            torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+            torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
             print(f"  ✓ 验证通过")
         except Exception as e:
             print(f"  ✗ 验证失败: {e}")
@@ -175,13 +184,13 @@ def test_dynamic_shapes(kernel):
     return True
 
 def main():
-    print("动态shape kernel离线加载验证")
+    print("动态shape GEMM kernel离线加载验证")
     print("=" * 50)
     
     cleanup_cache()
     
     try:
-        kernel = compile_dynamic_kernel()
+        kernel = compile_dynamic_gemm_kernel()
         save_kernel_to_disk(kernel)
         loaded_kernel = load_kernel_from_disk()
         success = test_dynamic_shapes(loaded_kernel)
