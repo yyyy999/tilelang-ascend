@@ -855,9 +855,38 @@ class JitKernel_NPU:
         if isinstance(out_idx, int):
             out_idx = [out_idx]
 
-        instance = cls(metadata)
+        metadata["kernel_src"] = kernel_source if kernel_source else metadata.get("kernel_src", "")
+        
+        instance = cls.__new__(cls)
+        instance.params = metadata["params"]
+        instance.signature = metadata.get("signature", {})
+        instance.out_idx = out_idx  
+        instance.param_info = metadata.get('param_info', [])
         instance.so_launcher_path = kernel_launcher_path
         instance.so_utils_path = kernel_utils_path
+        instance.utils_name = f"{metadata['name']}"
+        instance.utils_kernel_src = metadata.get("kernel_src", "")
+        instance.utils_shared = metadata.get("shared", {})
+        instance.mlir_content = metadata.get("mlir_content", "")
+        instance.mix_mode = metadata.get("mix_mode", False)
+        instance.utils_device = torch.npu.current_device()
+        instance.launch_stream = torch.npu.current_stream(
+            torch.npu.current_device()
+        ).npu_stream
+        instance.launch_packedMetadata = {
+            "kernel_name": f"{metadata['name']}",
+            "tensor_kinds": metadata.get("tensor_kinds", []),
+        }
+        instance.kernel_name = f"{metadata['name']}"
+        instance.tensor_kinds = metadata.get("tensor_kinds", [])
+        instance.launch_metadata = {}
+        instance.launch_enter_hook = None
+        instance.launch_exit_hook = None
+        instance.gridfunc = metadata.get("gridfunc", "")
+        instance.symbolic = metadata.get("symbolic", {})
+        instance.prim_func = metadata.get("primfunc")
+        instance.out_idx = metadata.get("out_idx", out_idx)
+        instance._launch()
         return instance
 
     def _launch(self):
