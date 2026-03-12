@@ -97,8 +97,7 @@ class NPUKernelLoader:
         result = self.npu_utils.load_kernel_binary(
             self.kernel_name,
             self.kernel_src,
-            len(self.kernel_src),
-            0,  # shared (unused)
+            0,
             self.device,
             kernel_mode,
         )
