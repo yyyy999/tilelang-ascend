@@ -65,7 +65,8 @@ def test_gemm():
         torch.testing.assert_close(c, ref, rtol=1e-2, atol=1e-2)
         print("  ✓ 函数接口验证通过")
         
-        c2 = torch.ops.tilelang_ascend.gemm(a, b)
+        c2 = torch.zeros(M, N, dtype=torch.float16, device="npu:0")
+        torch.ops.tilelang_ascend.gemm(a, b, c2)
         torch.testing.assert_close(c2, ref, rtol=1e-2, atol=1e-2)
         print("  ✓ torch.ops 接口验证通过")
 

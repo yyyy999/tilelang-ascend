@@ -143,7 +143,7 @@ def compile_dynamic_gemm_kernel():
     print("编译动态shape GEMM 内核")
     print("=" * 60)
     
-    @tilelang.jit(out_idx=[2], target="npuir")
+    @tilelang.jit(target="npuir")
     def matmul_dynamic(block_M=128, block_N=256, K_L1=16, dtype="float16", accum_dtype="float32"):
         M = T.symbolic("M")
         N = T.symbolic("N")
@@ -201,8 +201,9 @@ def compile_dynamic_gemm_kernel():
         print(f"  测试 shape: M={M}, N={N}, K={K}")
         a = torch.randn(M, K, dtype=torch.float16, device="npu")
         b = torch.randn(K, N, dtype=torch.float16, device="npu")
+        c = torch.randn(M, N, dtype=torch.float16, device="npu")
         
-        c = kernel(a, b)
+        kernel(a, b, c)
         
         ref = a @ b
         torch.testing.assert_close(c, ref, rtol=1e-2, atol=1e-2)

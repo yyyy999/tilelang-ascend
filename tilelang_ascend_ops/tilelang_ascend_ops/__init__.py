@@ -49,18 +49,18 @@ def _get_gemm_kernel():
     return _gemm_kernel
 
 
-def _gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    """GEMM 算子实现"""
+def _gemm_impl(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
+    """GEMM 算子实现 (C = A @ B)"""
     kernel = _get_gemm_kernel()
-    output = kernel(A, B)
-    return output
+    kernel(A, B, C)
+    return C
 
 
 # ============== 算子注册 ==============
 
 lib = torch.library.Library("tilelang_ascend", "DEF")
 lib.define("flash_attention(Tensor Q, Tensor K, Tensor V, float scale) -> Tensor")
-lib.define("gemm(Tensor A, Tensor B) -> Tensor")
+lib.define("gemm(Tensor A, Tensor B, Tensor C) -> Tensor")
 
 lib_impl = torch.library.Library("tilelang_ascend", "IMPL")
 lib_impl.impl("flash_attention", _flash_attention_impl, "PrivateUse1")
@@ -117,6 +117,7 @@ def flash_attention(
 def gemm(
     A: torch.Tensor,
     B: torch.Tensor,
+    C: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     动态shape GEMM 算子 (C = A @ B)
@@ -124,6 +125,7 @@ def gemm(
     Args:
         A: 输入矩阵 [M, K], NPU tensor, float16
         B: 输入矩阵 [K, N], NPU tensor, float16
+        C: 输出矩阵 [M, N], NPU tensor, float16 (可选，不传则自动分配)
     
     Returns:
         输出矩阵 [M, N], float16
@@ -147,4 +149,11 @@ def gemm(
     if K != K2:
         raise ValueError(f"Matrix dimension mismatch: A.shape[1]={K} != B.shape[0]={K2}")
     
-    return torch.ops.tilelang_ascend.gemm(A, B)
+    if C is None:
+        C = torch.randn(M, N, dtype=torch.float16, device=A.device)
+    elif C.device.type != "npu":
+        raise ValueError("C must be an NPU tensor")
+    elif C.shape != (M, N):
+        raise ValueError(f"C shape mismatch: expected ({M}, {N}), got {C.shape}")
+    
+    return torch.ops.tilelang_ascend.gemm(A, B, C)
