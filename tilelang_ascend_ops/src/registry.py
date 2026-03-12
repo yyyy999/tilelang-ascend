@@ -79,11 +79,11 @@ class OpRegistry:
 
 def register_all_ops():
     """注册所有算子"""
-    from .ops import FlashAttentionOp, GemmOp
+    from .ops import flash_attention_op, gemm_op
     
     registry = OpRegistry()
-    registry.register_op(FlashAttentionOp())
-    registry.register_op(GemmOp())
+    registry.register_op(flash_attention_op)
+    registry.register_op(gemm_op)
     registry.initialize()
     
     return registry
