@@ -39,11 +39,41 @@ def test_flash_attention():
     output2 = torch.ops.tilelang_ascend.flash_attention(q, k, v, scale)
     torch.testing.assert_close(output2, ref, rtol=1e-2, atol=1e-2)
     print("  ✓ torch.ops 接口验证通过")
-    
+
+
+def test_gemm():
+    """测试动态shape GEMM 算子"""
     print("\n" + "=" * 60)
-    print("✓ 所有测试通过！")
+    print("测试动态shape GEMM 算子")
     print("=" * 60)
+    
+    test_cases = [
+        (1024, 512, 2048),
+        (512, 1024, 512),
+        (256, 256, 256),
+    ]
+    
+    for M, N, K in test_cases:
+        print(f"\n测试 shape: M={M}, N={N}, K={K}")
+        
+        a = torch.randn(M, K, dtype=torch.float16, device="npu:0")
+        b = torch.randn(K, N, dtype=torch.float16, device="npu:0")
+        
+        c = tilelang_ascend_ops.gemm(a, b)
+        
+        ref = a @ b
+        torch.testing.assert_close(c, ref, rtol=1e-2, atol=1e-2)
+        print("  ✓ 函数接口验证通过")
+        
+        c2 = torch.ops.tilelang_ascend.gemm(a, b)
+        torch.testing.assert_close(c2, ref, rtol=1e-2, atol=1e-2)
+        print("  ✓ torch.ops 接口验证通过")
 
 
 if __name__ == "__main__":
     test_flash_attention()
+    test_gemm()
+    
+    print("\n" + "=" * 60)
+    print("✓ 所有测试通过！")
+    print("=" * 60)
