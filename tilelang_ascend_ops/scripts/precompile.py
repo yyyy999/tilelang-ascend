@@ -154,10 +154,17 @@ def _convert_shape_to_pure_python(shape):
     for dim in shape:
         if hasattr(dim, 'name'):
             result.append(dim.name)
-        elif isinstance(dim, (int, str)):
+        elif hasattr(dim, 'value'):
+            result.append(int(dim.value))
+        elif isinstance(dim, int):
+            result.append(dim)
+        elif isinstance(dim, str):
             result.append(dim)
         else:
-            result.append(str(dim))
+            try:
+                result.append(int(dim))
+            except (ValueError, TypeError):
+                result.append(str(dim))
     return result
 
 
