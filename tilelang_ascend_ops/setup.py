@@ -25,7 +25,11 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/tilelang/tilelang-ascend",
-    packages=["tilelang_ascend_ops"],
+    packages=[
+        "tilelang_ascend_ops",
+        "tilelang_ascend_ops.ops",
+        "tilelang_ascend_ops.kernels",
+    ],
     package_dir={"tilelang_ascend_ops": "src"},
     package_data={
         "tilelang_ascend_ops": ["kernels/**/*", "*.so", "*.pkl"],
