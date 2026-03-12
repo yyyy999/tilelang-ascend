@@ -16,7 +16,6 @@ __version__ = "0.1.0"
 __all__ = ["flash_attention", "KernelRegistry"]
 
 
-# 全局内核缓存
 _flash_attention_kernel = None
 
 
@@ -31,16 +30,10 @@ def _get_flash_attention_kernel():
 def _flash_attention_impl(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, scale: float) -> torch.Tensor:
     """Flash Attention 算子实现"""
     kernel = _get_flash_attention_kernel()
-    
-    # 调用内核
-    # 注意：scale 参数需要在内核中处理
-    # 如果内核不支持 scale 参数，需要在这里预处理
     output = kernel(Q, K, V)
-    
     return output
 
 
-# 注册算子
 lib = torch.library.Library("tilelang_ascend", "DEF")
 lib.define("flash_attention(Tensor Q, Tensor K, Tensor V, float scale) -> Tensor")
 
@@ -58,21 +51,21 @@ def flash_attention(
     Flash Attention 算子
     
     Args:
-        Q: Query tensor [seq_len, dim], NPU tensor
-        K: Key tensor [seq_len, dim], NPU tensor
-        V: Value tensor [seq_len, dim], NPU tensor
-        scale: 缩放因子，默认 1/sqrt(dim)
+        Q: Query 张量 [seq_len, dim], NPU tensor
+        K: Key 张量 [seq_len, dim], NPU tensor
+        V: Value 张量 [seq_len, dim], NPU tensor
+        scale: 缩放因子 (默认: 1/sqrt(dim))
     
     Returns:
-        Output tensor [seq_len, dim]
+        Output 张量 [seq_len, dim]
     
     Example:
         >>> import torch
         >>> import tilelang_ascend_ops
         >>>
-        >>> q = torch.randn(512, 128, dtype=torch.float16).npu()
-        >>> k = torch.randn(512, 128, dtype=torch.float16).npu()
-        >>> v = torch.randn(512, 128, dtype=torch.float16).npu()
+        >>> q = torch.randn(512, 128, dtype=torch.float16, device="npu")
+        >>> k = torch.randn(512, 128, dtype=torch.float16, device="npu")
+        >>> v = torch.randn(512, 128, dtype=torch.float16, device="npu")
         >>>
         >>> output = tilelang_ascend_ops.flash_attention(q, k, v)
     """
@@ -83,7 +76,11 @@ def flash_attention(
     if V.device.type != "npu":
         raise ValueError("V must be an NPU tensor")
     
+    seq_len, dim = Q.shape
+    if K.shape != (seq_len, dim) or V.shape != (seq_len, dim):
+        raise ValueError(f"Shape mismatch: Q={Q.shape}, K={K.shape}, V={V.shape}")
+    
     if scale is None:
-        scale = 1.0 / (Q.size(-1) ** 0.5)
+        scale = (1.0 / dim) ** 0.5
     
     return torch.ops.tilelang_ascend.flash_attention(Q, K, V, scale)

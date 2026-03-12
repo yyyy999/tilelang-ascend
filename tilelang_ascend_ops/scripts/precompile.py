@@ -30,56 +30,56 @@ PACKAGE_DIR = SCRIPT_DIR.parent / "tilelang_ascend_ops"
 KERNELS_DIR = PACKAGE_DIR / "kernels"
 
 
-def compile_flash_attention():
+def compile_flash_attention_kernel():
     """编译 Flash Attention 内核"""
     print("=" * 60)
     print("编译 Flash Attention 内核")
     print("=" * 60)
     
-    # 使用动态 shape
+    seq_len = 512
+    dim = 128
+    block_m = 64
+    block_n = 64
+    
     @tilelang.jit(out_idx=[-1], target="npuir")
-    def flash_attention_kernel(block_M=64, block_N=64, dtype="float16", accum_dtype="float32"):
-        # 动态 shape
-        M = T.symbolic("M")
-        N = T.symbolic("N")
-        
+    def flash_attention_kernel(dtype="float16", accum_dtype="float32"):
         @T.prim_func
         def main(
-            Q: T.Tensor((M, N), dtype),
-            K: T.Tensor((M, N), dtype),
-            V: T.Tensor((M, N), dtype),
-            Output: T.Tensor((M, N), dtype),
+            Q: T.Tensor((seq_len, dim), dtype),
+            K: T.Tensor((seq_len, dim), dtype),
+            V: T.Tensor((seq_len, dim), dtype),
+            Output: T.Tensor((seq_len, dim), dtype),
         ):
-            with T.Kernel(T.ceildiv(M, block_M), is_npu=True) as (cid, _):
-                offset = cid * block_M
-                Q_shared = T.alloc_shared([block_M, N], dtype)
-                T.copy(Q[offset : offset + block_M, 0 : N], Q_shared)
+            with T.Kernel(T.ceildiv(seq_len, block_m), is_npu=True) as (cid, _):
+                offset = cid * block_m
+                Q_shared = T.alloc_shared([block_m, dim], dtype)
+                T.copy(Q[offset : offset + block_m, 0 : dim], Q_shared)
 
-                K_shared = T.alloc_shared([block_N, N], dtype)
-                V_shared = T.alloc_shared([block_N, N], dtype)
-                scores = T.alloc_fragment([block_M, block_N], accum_dtype)
-                scores_cast = T.alloc_fragment([block_M, block_N], dtype)
-                correction = T.alloc_fragment([block_M, 1], accum_dtype)
-                local_max = T.alloc_fragment([block_M, 1], accum_dtype)
-                local_sum = T.alloc_fragment([block_M, 1], accum_dtype)
-                acc_m = T.alloc_fragment([block_M, 1], accum_dtype)
-                acc_l = T.alloc_fragment([block_M, 1], accum_dtype)
-                acc_o = T.alloc_fragment([block_M, N], accum_dtype)
-                tmp = T.alloc_fragment([block_M, block_N], accum_dtype)
-                tmp1 = T.alloc_fragment([block_M, 1], accum_dtype)
-                new_max = T.alloc_fragment([block_M, 1], accum_dtype)
-                scales = T.alloc_fragment([block_M, block_N], accum_dtype)
+                K_shared = T.alloc_shared([block_n, dim], dtype)
+                V_shared = T.alloc_shared([block_n, dim], dtype)
+                scores = T.alloc_fragment([block_m, block_n], accum_dtype)
+                scores_cast = T.alloc_fragment([block_m, block_n], dtype)
+                correction = T.alloc_fragment([block_m, 1], accum_dtype)
+                local_max = T.alloc_fragment([block_m, 1], accum_dtype)
+                local_sum = T.alloc_fragment([block_m, 1], accum_dtype)
+                acc_m = T.alloc_fragment([block_m, 1], accum_dtype)
+                acc_l = T.alloc_fragment([block_m, 1], accum_dtype)
+                acc_o = T.alloc_fragment([block_m, dim], accum_dtype)
+                tmp = T.alloc_fragment([block_m, block_n], accum_dtype)
+                tmp1 = T.alloc_fragment([block_m, 1], accum_dtype)
+                new_max = T.alloc_fragment([block_m, 1], accum_dtype)
+                scales = T.alloc_fragment([block_m, block_n], accum_dtype)
 
                 value_zero = 0
-                scale = (1.0 / N) ** 0.5
+                scale = (1.0 / dim) ** 0.5
                 value_min = -T.infinity(accum_dtype)
                 T.vbrc(value_zero, acc_o)
                 T.vbrc(value_zero, acc_l)
                 T.vbrc(value_min, acc_m)
                 T.vbrc(scale, scales)
 
-                for k in T.Pipelined(T.ceildiv(M, block_N), num_stages=2):
-                    T.copy(K[k * block_N : (k + 1) * block_N, 0 : N], K_shared)
+                for k in T.Pipelined(T.ceildiv(seq_len, block_n), num_stages=2):
+                    T.copy(K[k * block_n : (k + 1) * block_n, 0 : dim], K_shared)
                     T.gemm(Q_shared, K_shared, scores, initC=True, b_transpose=True)
 
                     T.vmul(scores, scales, scores)
@@ -97,14 +97,14 @@ def compile_flash_attention():
                     T.vbrc(value_zero, tmp1)
                     T.vadd(tmp1, new_max, acc_m)
 
-                    T.copy(V[k * block_N : (k + 1) * block_N, 0 : N], V_shared)
+                    T.copy(V[k * block_n : (k + 1) * block_n, 0 : dim], V_shared)
                     T.gemm(scores_cast, V_shared, acc_o, initC=False)
 
                 T.vdiv(acc_o, acc_l, acc_o)
-                O_cast = T.alloc_shared([block_M, N], dtype)
+                O_cast = T.alloc_shared([block_m, dim], dtype)
                 T.vcast(acc_o, O_cast, round_mode="rint")
-                real_m = T.min(block_M, M - cid * block_M)
-                T.copy(O_cast, Output[cid * block_M : cid * block_m + real_m, 0 : N])
+                real_m = T.min(block_m, seq_len - cid * block_m)
+                T.copy(O_cast, Output[cid * block_m : cid * block_m + real_m, 0 : dim])
 
         return main
     
@@ -112,17 +112,21 @@ def compile_flash_attention():
     print("正在编译...")
     kernel = flash_attention_kernel()
     
+    print(f"Kernel 编译完成")
+    print(f"  - symbolic: {kernel.symbolic}")
+    print(f"  - param_info: {kernel.param_info}")
+    print(f"  - out_idx: {kernel.out_idx}")
+    
     # 测试运行
-    print("测试运行...")
-    M, N = 512, 128
-    q = torch.randn(M, N, dtype=torch.float16, device="npu")
-    k = torch.randn(M, N, dtype=torch.float16, device="npu")
-    v = torch.randn(M, N, dtype=torch.float16, device="npu")
+    print("\n测试运行...")
+    q = torch.randn(seq_len, dim, dtype=torch.float16, device="npu")
+    k = torch.randn(seq_len, dim, dtype=torch.float16, device="npu")
+    v = torch.randn(seq_len, dim, dtype=torch.float16, device="npu")
     
     output = kernel(q, k, v)
     
     # 验证结果
-    scale = (1.0 / N) ** 0.5
+    scale = (1.0 / dim) ** 0.5
     ref = torch.nn.functional.softmax(
         (q @ k.T).to(torch.float32) * scale, dim=-1
     ).to(torch.float16) @ v
@@ -140,10 +144,28 @@ def save_kernel(kernel, name: str):
     
     print(f"\n保存内核到: {kernel_dir}")
     
+    # 构建 metadata
+    metadata = {
+        "symbolic": kernel.symbolic,
+        "params": kernel.params,
+        "out_idx": kernel.out_idx,
+        "param_info": kernel.param_info,
+        "signature": kernel.signature,
+        "primfunc": kernel.prim_func,
+        "mlir_content": kernel.mlir_content,
+        "shared": kernel.utils_shared,
+        "kernel_name": kernel.kernel_name,
+        "gridfunc": kernel.gridfunc,
+        "mix_mode": kernel.mix_mode,
+        "name": kernel.utils_name,
+        "tensor_kinds": kernel.tensor_kinds,
+        "kernel_src": kernel.utils_kernel_src,
+    }
+    
     # 保存 metadata
     metadata_path = kernel_dir / "metadata.pkl"
     with open(metadata_path, "wb") as f:
-        cloudpickle.dump(kernel.metadata, f)
+        cloudpickle.dump(metadata, f)
     print(f"  ✓ metadata.pkl")
     
     # 复制 main.so (启动器)
@@ -163,6 +185,13 @@ def save_kernel(kernel, name: str):
         print(f"  ✗ npu_utils.so 不存在: {utils_src}")
     
     print(f"✓ 内核保存完成: {kernel_dir}")
+    
+    # 打印 metadata 内容
+    print(f"\n保存的 metadata 内容:")
+    print(f"  - symbolic: {metadata['symbolic']}")
+    print(f"  - param_info 长度: {len(metadata['param_info'])}")
+    for i, info in enumerate(metadata['param_info']):
+        print(f"    [{i}] dtype={info['dtype']}, shape={info['shape']}, is_output={info['is_output']}")
 
 
 def main():
@@ -175,7 +204,7 @@ def main():
     KERNELS_DIR.mkdir(parents=True, exist_ok=True)
     
     # 编译 Flash Attention
-    kernel = compile_flash_attention()
+    kernel = compile_flash_attention_kernel()
     save_kernel(kernel, "flash_attention")
     
     print("\n" + "=" * 60)
