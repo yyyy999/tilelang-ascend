@@ -2,11 +2,16 @@
 Flash Attention 内核定义
 
 固定 shape: seq_len=512, dim=128
+使用 online softmax 算法
 """
 
+import os
 import torch
 import tilelang
 import tilelang.language as T
+
+seq_len = 512
+dim = 128
 
 
 def compile_flash_attention_kernel():
@@ -15,48 +20,84 @@ def compile_flash_attention_kernel():
     print("编译 Flash Attention 内核")
     print("=" * 60)
     
-    seq_len = 512
-    dim = 128
-    block_m = 64
-    block_n = 64
+    os.environ['TILELANG_ASCEND_MODE'] = 'Developer'
     
     @tilelang.jit(out_idx=[-1], target="npuir")
-    def flash_attention_kernel(dtype="float16", accum_dtype="float32"):
-        @T.prim_func
-        def main(
-            Q: T.Tensor((seq_len, dim), dtype),
-            K: T.Tensor((seq_len, dim), dtype),
-            V: T.Tensor((seq_len, dim), dtype),
-            Output: T.Tensor((seq_len, dim), dtype),
-        ):
-            with T.Kernel(T.ceildiv(seq_len, block_m), block_n, is_npu=True) as (bx, by):
-                Q_BUF = T.alloc_L1([block_m, dim], dtype)
-                K_BUF = T.alloc_L1([block_n, dim], dtype)
-                V_BUF = T.alloc_L1([block_n, dim], dtype)
-                O_BUF = T.alloc_L1([block_m, dim], dtype)
-                acc_s = T.alloc_L0C([block_m, block_n], accum_dtype)
-                acc_o = T.alloc_L0C([block_m, dim], accum_dtype)
-                
-                T.load_nd2nz(Q[bx * block_m, 0], Q_BUF, [block_m, dim])
-                
-                for i in T.serial(T.ceildiv(seq_len, block_n)):
-                    T.load_nd2nz(K[i * block_n, 0], K_BUF, [block_n, dim])
-                    T.load_nd2nz(V[i * block_n, 0], V_BUF, [block_n, dim])
-                    
-                    T.gemm(Q_BUF, K_BUF, acc_s, initC=True, b_transpose=True)
-                    
-                    for j in T.serial(block_m):
-                        for k in T.serial(block_n):
-                            acc_s[j, k] = T.exp(acc_s[j, k] * (1.0 / (dim ** 0.5)))
-                    
-                    T.gemm(acc_s, V_BUF, acc_o, initC=False)
-                
-                T.store_fixpipe(acc_o, Output[bx * block_m, 0], enable_nz2nd=True)
+    def online_flash_attention(block_M=64, block_N=64, block_K=32, dtype="float16", accum_dtype="float32"):
+        shape_q = [seq_len, dim]
+        shape_k = [seq_len, dim]
+        shape_v = [seq_len, dim]
+        shape_o = [seq_len, dim]
+        block_m = block_M
+        block_n = block_N
         
-        return main
+        @T.prim_func
+        def flash_attention(
+            Q: T.Tensor(shape_q, dtype),
+            K: T.Tensor(shape_k, dtype),
+            V: T.Tensor(shape_v, dtype),
+            Output: T.Tensor(shape_o, dtype),
+        ):
+            with T.Kernel(T.ceildiv(seq_len, block_m), is_npu=True) as (cid, _):
+                offset = cid * block_m
+                Q_shared = T.alloc_shared([block_m, dim], dtype)
+                T.copy(Q[offset : offset + block_m, 0 : dim], Q_shared)
+
+                K_shared = T.alloc_shared([block_n, dim], dtype)
+                V_shared = T.alloc_shared([block_n, dim], dtype)
+                scores = T.alloc_fragment([block_m, block_n], accum_dtype)
+                scores_cast = T.alloc_fragment([block_m, block_n], dtype)
+                correction = T.alloc_fragment([block_m, 1], accum_dtype)
+                local_max = T.alloc_fragment([block_m, 1], accum_dtype)
+                local_sum = T.alloc_fragment([block_m, 1], accum_dtype)
+                acc_m = T.alloc_fragment([block_m, 1], accum_dtype)
+                acc_l = T.alloc_fragment([block_m, 1], accum_dtype)
+                acc_o = T.alloc_fragment([block_m, dim], accum_dtype)
+                tmp = T.alloc_fragment([block_m, block_n], accum_dtype)
+                tmp1 = T.alloc_fragment([block_m, 1], accum_dtype)
+                new_max = T.alloc_fragment([block_m, 1], accum_dtype)
+                scales = T.alloc_fragment([block_m, block_n], accum_dtype)
+
+                value_zero = 0
+                scale = (1.0 / dim) ** 0.5
+                value_min = -T.infinity(accum_dtype)
+                T.vbrc(value_zero, acc_o)
+                T.vbrc(value_zero, acc_l)
+                T.vbrc(value_min, acc_m)
+                T.vbrc(scale, scales)
+
+                for k in T.Pipelined(T.ceildiv(seq_len, block_n), num_stages=2):
+                    T.copy(K[k * block_n : (k + 1) * block_n, 0 : dim], K_shared)
+                    T.gemm(Q_shared, K_shared, scores, initC=True, b_transpose=True)
+
+                    T.vmul(scores, scales, scores)
+                    T.reduce_max(scores, local_max, dim=1)
+                    T.vmax(acc_m, local_max, new_max)
+                    T.vsub(acc_m, new_max, tmp1)
+                    T.vexp(tmp1, correction)
+                    T.vsub(scores, new_max, tmp)
+                    T.vexp(tmp, scores)
+                    T.reduce_sum(scores, local_sum, dim=1)
+                    T.vmul(acc_l, correction, acc_l)
+                    T.vadd(acc_l, local_sum, acc_l)
+                    T.vmul(acc_o, correction, acc_o)
+                    T.vcast(scores, scores_cast, round_mode="rint")
+                    T.vbrc(value_zero, tmp1)
+                    T.vadd(tmp1, new_max, acc_m)
+
+                    T.copy(V[k * block_n : (k + 1) * block_n, 0 : dim], V_shared)
+                    T.gemm(scores_cast, V_shared, acc_o, initC=False)
+
+                T.vdiv(acc_o, acc_l, acc_o)
+                O_cast = T.alloc_shared([block_m, dim], dtype)
+                T.vcast(acc_o, O_cast, round_mode="rint")
+                real_m = T.min(block_m, seq_len - cid * block_m)
+                T.copy(O_cast, Output[cid * block_m : cid * block_m + real_m, 0 : dim])
+
+        return flash_attention
     
     print("正在编译...")
-    kernel = flash_attention_kernel()
+    kernel = online_flash_attention()
     
     print(f"Kernel 编译完成")
     print(f"  - symbolic: {kernel.symbolic}")

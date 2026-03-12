@@ -4,6 +4,7 @@
 支持任意 M, N, K 维度的矩阵乘法
 """
 
+import os
 import torch
 import tilelang
 import tilelang.language as T
@@ -15,8 +16,10 @@ def compile_gemm_kernel():
     print("编译动态shape GEMM 内核")
     print("=" * 60)
     
+    os.environ['TILELANG_ASCEND_MODE'] = 'Expert'
+    
     @tilelang.jit(target="npuir")
-    def matmul_dynamic(block_M=128, block_N=256, K_L1=16, dtype="float16", accum_dtype="float32"):
+    def matmul(block_M=128, block_N=256, K_L1=16, dtype="float16", accum_dtype="float32"):
         M = T.symbolic("M")
         N = T.symbolic("N")
         K = T.symbolic("K")
@@ -56,7 +59,7 @@ def compile_gemm_kernel():
         return main
     
     print("正在编译...")
-    kernel = matmul_dynamic()
+    kernel = matmul()
     
     print(f"Kernel 编译完成")
     print(f"  - symbolic: {kernel.symbolic}")
