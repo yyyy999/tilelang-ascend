@@ -103,19 +103,18 @@ def save_kernel(kernel, name: str):
     # .so 文件在当前工作目录
     cwd = Path(os.getcwd())
     
-    # 复制 main.so (启动器)
-    launcher_so_name = f"{kernel.kernel_name}.so"
-    launcher_so_path = cwd / launcher_so_name
+    # 复制 main.so (启动器) - 使用 kernel.so_launcher_path
+    launcher_so_path = cwd / kernel.so_launcher_path
     
     if launcher_so_path.exists():
         shutil.copy(launcher_so_path, kernel_dir / "main.so")
         print(f"  ✓ 保存 main.so (from {launcher_so_path})")
     else:
         print(f"  ✗ 错误: 找不到 {launcher_so_path}")
-        print(f"    当前目录文件: {list(cwd.glob('*.so'))}")
+        print(f"    当前目录 .so 文件: {list(cwd.glob('*.so'))}")
     
-    # 复制 npu_utils.so (工具库)
-    utils_so_path = cwd / "npu_utils.so"
+    # 复制 npu_utils.so (工具库) - 使用 kernel.so_utils_path
+    utils_so_path = cwd / kernel.so_utils_path
     
     if utils_so_path.exists():
         shutil.copy(utils_so_path, kernel_dir / "npu_utils.so")

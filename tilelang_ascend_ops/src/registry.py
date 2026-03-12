@@ -57,11 +57,19 @@ class OpRegistry:
     @classmethod
     def _register_single_op(cls, op: BaseOp):
         """注册单个算子"""
-        def impl(*args, **kwargs):
-            return op.impl(*args, **kwargs, registry=cls._kernel_registry)
+        class OpImpl:
+            """算子实现包装类"""
+            def __init__(self, op_instance, kernel_registry):
+                self.op = op_instance
+                self.registry = kernel_registry
+            
+            def __call__(self, *args, **kwargs):
+                return self.op.impl(*args, **kwargs, registry=self.registry)
+        
+        impl_func = OpImpl(op, cls._kernel_registry)
         
         cls._lib_def.define(op.signature)
-        cls._lib_impl.impl(op.name, impl, "PrivateUse1")
+        cls._lib_impl.impl(op.name, impl_func, "PrivateUse1")
     
     @classmethod
     def get_kernel_registry(cls):
