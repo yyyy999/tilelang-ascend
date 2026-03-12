@@ -100,31 +100,37 @@ def save_kernel(kernel, name: str):
         cloudpickle.dump(metadata, f)
     print(f"  ✓ 保存 metadata.pkl")
     
-    if not hasattr(kernel, 'mod_path') or kernel.mod_path is None:
-        print(f"  ⚠ 警告: kernel.mod_path 不存在，跳过 .so 文件复制")
-        return
+    # .so 文件在当前工作目录
+    cwd = Path(os.getcwd())
     
-    cache_dir = Path(kernel.mod_path).parent
+    # 复制 main.so (启动器)
+    launcher_so_name = f"{kernel.kernel_name}.so"
+    launcher_so_path = cwd / launcher_so_name
     
-    main_so = cache_dir / "main.so"
-    if main_so.exists():
-        shutil.copy(main_so, kernel_dir / "main.so")
-        print(f"  ✓ 保存 main.so")
+    if launcher_so_path.exists():
+        shutil.copy(launcher_so_path, kernel_dir / "main.so")
+        print(f"  ✓ 保存 main.so (from {launcher_so_path})")
     else:
-        print(f"  ⚠ 警告: {main_so} 不存在")
+        print(f"  ✗ 错误: 找不到 {launcher_so_path}")
+        print(f"    当前目录文件: {list(cwd.glob('*.so'))}")
     
-    npu_utils_so = cache_dir / "npu_utils.so"
-    if npu_utils_so.exists():
-        shutil.copy(npu_utils_so, kernel_dir / "npu_utils.so")
-        print(f"  ✓ 保存 npu_utils.so")
+    # 复制 npu_utils.so (工具库)
+    utils_so_path = cwd / "npu_utils.so"
+    
+    if utils_so_path.exists():
+        shutil.copy(utils_so_path, kernel_dir / "npu_utils.so")
+        print(f"  ✓ 保存 npu_utils.so (from {utils_so_path})")
     else:
-        print(f"  ⚠ 警告: {npu_utils_so} 不存在")
+        print(f"  ✗ 错误: 找不到 {utils_so_path}")
+        print(f"    当前目录文件: {list(cwd.glob('*.so'))}")
 
 
 def main():
     print("TileLang Ascend Operators - 预编译脚本")
     print("=" * 60)
     print(f"可用内核: {list(KERNEL_REGISTRY.keys())}")
+    print(f"当前工作目录: {os.getcwd()}")
+    print(f"内核输出目录: {KERNELS_DIR}")
     print("=" * 60)
     
     if len(sys.argv) > 1:
@@ -138,6 +144,7 @@ def main():
         shutil.rmtree(KERNELS_DIR)
     KERNELS_DIR.mkdir(parents=True, exist_ok=True)
     
+    success_kernels = []
     for name in kernels_to_compile:
         if name not in KERNEL_REGISTRY:
             print(f"警告: 未知内核 '{name}'，跳过")
@@ -147,14 +154,22 @@ def main():
             compile_func = KERNEL_REGISTRY[name]
             kernel = compile_func()
             save_kernel(kernel, name)
+            success_kernels.append(name)
         except Exception as e:
             print(f"错误: 编译 '{name}' 失败: {e}")
             import traceback
             traceback.print_exc()
     
     print("\n" + "=" * 60)
-    print("✓ 预编译完成！")
+    print(f"✓ 预编译完成！成功: {success_kernels}")
     print(f"内核目录: {KERNELS_DIR}")
+    
+    # 列出生成的文件
+    for name in success_kernels:
+        kernel_dir = KERNELS_DIR / name
+        files = list(kernel_dir.glob("*"))
+        print(f"  {name}/: {[f.name for f in files]}")
+    
     print("=" * 60)
 
 

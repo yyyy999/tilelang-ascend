@@ -28,7 +28,8 @@ setup(
     package_dir={"": "src"},
     packages=find_packages(where="src"),
     package_data={
-        "": ["kernels/**/*"],
+        "": ["*.so", "*.o", "*.pkl"],
+        "kernels": ["**/*"],
     },
     include_package_data=True,
     python_requires=">=3.8",
