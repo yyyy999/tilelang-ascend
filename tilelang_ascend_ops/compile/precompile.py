@@ -4,8 +4,8 @@ TileLang Ascend Operators - 预编译脚本
 编译所有算子内核并保存到 kernels 目录。
 
 Usage:
-    python scripts/precompile.py              # 编译所有内核
-    python scripts/precompile.py flash_attention  # 只编译指定内核
+    python compile/precompile.py              # 编译所有内核
+    python compile/precompile.py flash_attention  # 只编译指定内核
 """
 
 import os
@@ -19,9 +19,11 @@ import cloudpickle
 torch.npu.set_device(0)
 
 SCRIPT_DIR = Path(__file__).parent
-PACKAGE_DIR = SCRIPT_DIR.parent / "tilelang_ascend_ops"
+PROJECT_DIR = SCRIPT_DIR.parent
+PACKAGE_DIR = PROJECT_DIR / "src"
 KERNELS_DIR = PACKAGE_DIR / "kernels"
 
+sys.path.insert(0, str(SCRIPT_DIR))
 from kernels import KERNEL_REGISTRY
 
 
@@ -98,17 +100,25 @@ def save_kernel(kernel, name: str):
         cloudpickle.dump(metadata, f)
     print(f"  ✓ 保存 metadata.pkl")
     
+    if not hasattr(kernel, 'mod_path') or kernel.mod_path is None:
+        print(f"  ⚠ 警告: kernel.mod_path 不存在，跳过 .so 文件复制")
+        return
+    
     cache_dir = Path(kernel.mod_path).parent
     
     main_so = cache_dir / "main.so"
     if main_so.exists():
         shutil.copy(main_so, kernel_dir / "main.so")
         print(f"  ✓ 保存 main.so")
+    else:
+        print(f"  ⚠ 警告: {main_so} 不存在")
     
     npu_utils_so = cache_dir / "npu_utils.so"
     if npu_utils_so.exists():
         shutil.copy(npu_utils_so, kernel_dir / "npu_utils.so")
         print(f"  ✓ 保存 npu_utils.so")
+    else:
+        print(f"  ⚠ 警告: {npu_utils_so} 不存在")
 
 
 def main():

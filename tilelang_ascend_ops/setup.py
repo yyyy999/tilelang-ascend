@@ -13,7 +13,6 @@ from pathlib import Path
 PACKAGE_NAME = "tilelang_ascend_ops"
 VERSION = "0.1.0"
 
-# 读取 README
 readme_path = Path(__file__).parent / "README.md"
 long_description = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
 
@@ -26,12 +25,10 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/tilelang/tilelang-ascend",
-    packages=find_packages(),
-    package_dir={"": "."},
+    package_dir={"": "src"},
+    packages=find_packages(where="src"),
     package_data={
-        "tilelang_ascend_ops": [
-            "kernels/**/*",
-        ],
+        "": ["kernels/**/*"],
     },
     include_package_data=True,
     python_requires=">=3.8",

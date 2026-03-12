@@ -23,7 +23,12 @@ def compile_flash_attention_kernel():
     @tilelang.jit(out_idx=[-1], target="npuir")
     def flash_attention_kernel(dtype="float16", accum_dtype="float32"):
         @T.prim_func
-        def main(Q, K, V, Output):
+        def main(
+            Q: T.Tensor((seq_len, dim), dtype),
+            K: T.Tensor((seq_len, dim), dtype),
+            V: T.Tensor((seq_len, dim), dtype),
+            Output: T.Tensor((seq_len, dim), dtype),
+        ):
             with T.Kernel(T.ceildiv(seq_len, block_m), block_n, is_npu=True) as (bx, by):
                 Q_BUF = T.alloc_L1([block_m, dim], dtype)
                 K_BUF = T.alloc_L1([block_n, dim], dtype)
