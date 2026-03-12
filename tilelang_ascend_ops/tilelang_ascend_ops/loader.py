@@ -45,7 +45,6 @@ class NPUKernelLoader:
             self.metadata = cloudpickle.load(f)
         
         # 提取元数据字段
-        self.params = self.metadata["params"]
         self.signature = self.metadata.get("signature", {})
         self.out_idx = self.metadata.get("out_idx", [-1])
         if isinstance(self.out_idx, int):
@@ -56,7 +55,7 @@ class NPUKernelLoader:
         self.kernel_src = self.metadata.get("kernel_src", b"")
         self.kernel_name = self.metadata.get("name", "kernel")
         self.tensor_kinds = self.metadata.get("tensor_kinds", [])
-        self.shared = self.metadata.get("shared", {})
+        self.shared = self.metadata.get("shared", 1)
         self.mix_mode = self.metadata.get("mix_mode", False)
         
         # 设备信息
