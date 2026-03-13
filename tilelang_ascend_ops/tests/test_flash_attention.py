@@ -3,7 +3,7 @@ Flash Attention 算子测试
 """
 
 import torch
-import tilelang_ascend_ops
+import tl_ascend_ops
 
 
 def test_flash_attention():
@@ -23,7 +23,7 @@ def test_flash_attention():
     
     scale = (1.0 / dim) ** 0.5
     
-    output = tilelang_ascend_ops.flash_attention(q, k, v, scale)
+    output = tl_ascend_ops.flash_attention(q, k, v, scale)
     
     ref = torch.nn.functional.softmax(
         (q @ k.T).to(torch.float32) * scale, dim=-1

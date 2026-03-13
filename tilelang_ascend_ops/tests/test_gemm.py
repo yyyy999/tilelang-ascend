@@ -3,7 +3,7 @@
 """
 
 import torch
-import tilelang_ascend_ops
+import tl_ascend_ops
 
 
 def test_gemm():
@@ -24,7 +24,7 @@ def test_gemm():
         a = torch.randn(M, K, dtype=torch.float16, device="npu:0")
         b = torch.randn(K, N, dtype=torch.float16, device="npu:0")
         
-        c = tilelang_ascend_ops.gemm(a, b)
+        c = tl_ascend_ops.gemm(a, b)
         
         ref = a @ b
         torch.testing.assert_close(c, ref, rtol=1e-2, atol=1e-2)

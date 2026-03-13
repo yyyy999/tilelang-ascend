@@ -6,7 +6,6 @@ TileLang Ascend Operators Package
 依赖：
 - torch >= 2.0.0
 - torch_npu
-- cloudpickle
 
 使用方式：
     import tilelang_ascend_ops
@@ -22,48 +21,20 @@ TileLang Ascend Operators Package
     torch.ops.tilelang_ascend.gemm(a, b, c)
 """
 
-import torch
 from .loader import KernelRegistry
+from .registry import register_all_ops, get_kernel_registry
 
 __version__ = "0.1.0"
 
-# 全局内核注册中心
-_kernel_registry = KernelRegistry
+# 注册所有算子
+_registered_ops = register_all_ops()
 
-# 定义 PyTorch 算子库
-_lib_def = torch.library.Library("tilelang_ascend", "DEF")
-_lib_impl = torch.library.Library("tilelang_ascend", "IMPL")
-
-
-# ============== Flash Attention ==============
-
+# 导入算子 Python API
 from .ops.flash_attention import flash_attention_op
-
-_lib_def.define(flash_attention_op.signature)
-
-def _flash_attention_impl(Q, K, V, scale):
-    return flash_attention_op.impl(Q, K, V, scale, registry=_kernel_registry)
-
-_lib_impl.impl("flash_attention", _flash_attention_impl, "PrivateUse1")
-
-flash_attention = flash_attention_op.python_api
-
-
-# ============== GEMM ==============
-
 from .ops.gemm import gemm_op
 
-_lib_def.define(gemm_op.signature)
-
-def _gemm_impl(A, B, C):
-    return gemm_op.impl(A, B, C, registry=_kernel_registry)
-
-_lib_impl.impl("gemm", _gemm_impl, "PrivateUse1")
-
+flash_attention = flash_attention_op.python_api
 gemm = gemm_op.python_api
-
-
-# ============== 导出 ==============
 
 __all__ = [
     "flash_attention",
@@ -71,6 +42,8 @@ __all__ = [
     "KernelRegistry",
     "flash_attention_op",
     "gemm_op",
+    "register_all_ops",
+    "get_kernel_registry",
 ]
 
-print(f"✓ tilelang_ascend_ops 加载完成，已注册算子: flash_attention, gemm")
+print(f"✓ tilelang_ascend_ops 加载完成")

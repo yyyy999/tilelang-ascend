@@ -10,7 +10,7 @@ TileLang Ascend Operators - 安装配置
 from setuptools import setup, find_packages
 from pathlib import Path
 
-PACKAGE_NAME = "tilelang_ascend_ops"
+PACKAGE_NAME = "tl_ascend_ops"
 VERSION = "0.1.0"
 
 readme_path = Path(__file__).parent / "README.md"
@@ -26,13 +26,13 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/tilelang/tilelang-ascend",
     packages=[
-        "tilelang_ascend_ops",
-        "tilelang_ascend_ops.ops",
-        "tilelang_ascend_ops.kernels",
+        "tl_ascend_ops",
+        "tl_ascend_ops.ops",
+        "tl_ascend_ops.kernels",
     ],
-    package_dir={"tilelang_ascend_ops": "src"},
+    package_dir={"tl_ascend_ops": "src"},
     package_data={
-        "tilelang_ascend_ops": ["kernels/**/*", "*.so", "*.pkl"],
+        "tl_ascend_ops": ["kernels/**/*", "*.so", "*.pkl"],
     },
     include_package_data=True,
     python_requires=">=3.8",
