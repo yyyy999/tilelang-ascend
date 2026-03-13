@@ -10,13 +10,16 @@ TileLang Ascend Operators Package
 使用方式：
     import tilelang_ascend_ops
     
-    # Flash Attention
+    # 方式 1: 通过包调用
     output = tilelang_ascend_ops.flash_attention(q, k, v)
-    
-    # GEMM
     c = tilelang_ascend_ops.gemm(a, b)
     
-    # 或使用 torch.ops 接口
+    # 方式 2: 通过 torch_npu 调用
+    import torch_npu
+    output = torch_npu.flash_attention(q, k, v)
+    c = torch_npu.gemm(a, b)
+    
+    # 方式 3: 通过 torch.ops 调用
     output = torch.ops.tilelang_ascend.flash_attention(q, k, v, scale)
     torch.ops.tilelang_ascend.gemm(a, b, c)
 """
@@ -35,6 +38,27 @@ from .ops.gemm import gemm_op
 
 flash_attention = flash_attention_op.python_api
 gemm = gemm_op.python_api
+
+# 注入到 torch_npu 模块
+def _inject_to_torch_npu():
+    """将算子接口注入到 torch_npu 模块"""
+    try:
+        import torch_npu
+        
+        # 动态注入所有已注册的算子
+        injected_ops = []
+        for op_name, op in _registered_ops.items():
+            op_func = getattr(op, 'python_api', None)
+            if op_func is not None:
+                setattr(torch_npu, op_name, op_func)
+                injected_ops.append(op_name)
+        
+        torch_npu.KernelRegistry = KernelRegistry
+        print(f"✓ 已注入算子到 torch_npu: {', '.join(injected_ops)}")
+    except ImportError:
+        print(f"⚠ torch_npu 未安装，跳过注入")
+
+_inject_to_torch_npu()
 
 __all__ = [
     "flash_attention",

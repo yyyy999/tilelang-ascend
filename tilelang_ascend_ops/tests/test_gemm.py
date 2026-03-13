@@ -3,6 +3,7 @@
 """
 
 import torch
+import torch_npu
 import tl_ascend_ops
 
 
@@ -23,17 +24,23 @@ def test_gemm():
         
         a = torch.randn(M, K, dtype=torch.float16, device="npu:0")
         b = torch.randn(K, N, dtype=torch.float16, device="npu:0")
-        
-        c = tl_ascend_ops.gemm(a, b)
-        
         ref = a @ b
-        torch.testing.assert_close(c, ref, rtol=1e-2, atol=1e-2)
-        print("  ✓ 函数接口验证通过")
         
-        c2 = torch.zeros(M, N, dtype=torch.float16, device="npu:0")
-        torch.ops.tilelang_ascend.gemm(a, b, c2)
+        # 方式 1: 通过包调用
+        c = tl_ascend_ops.gemm(a, b)
+        torch.testing.assert_close(c, ref, rtol=1e-2, atol=1e-2)
+        print("  ✓ tl_ascend_ops.gemm 验证通过")
+        
+        # 方式 2: 通过 torch_npu 调用
+        c2 = torch_npu.gemm(a, b)
         torch.testing.assert_close(c2, ref, rtol=1e-2, atol=1e-2)
-        print("  ✓ torch.ops 接口验证通过")
+        print("  ✓ torch_npu.gemm 验证通过")
+        
+        # 方式 3: 通过 torch.ops 调用
+        c3 = torch.zeros(M, N, dtype=torch.float16, device="npu:0")
+        torch.ops.tl_ascend_ops.gemm(a, b, c3)
+        torch.testing.assert_close(c3, ref, rtol=1e-2, atol=1e-2)
+        print("  ✓ torch.ops.tl_ascend_ops.gemm 验证通过")
 
 
 if __name__ == "__main__":

@@ -65,7 +65,7 @@ class FlashAttentionOp(BaseOp):
         if scale is None:
             scale = (1.0 / dim) ** 0.5
         
-        return torch.ops.tilelang_ascend.flash_attention(Q, K, V, scale)
+        return torch.ops.tl_ascend_ops.flash_attention(Q, K, V, scale)
 
 
 flash_attention_op = FlashAttentionOp()

@@ -66,7 +66,7 @@ class GemmOp(BaseOp):
         elif C.shape != (M, N):
             raise ValueError(f"C shape mismatch: expected ({M}, {N}), got {C.shape}")
         
-        return torch.ops.tilelang_ascend.gemm(A, B, C)
+        return torch.ops.tl_ascend_ops.gemm(A, B, C)
 
 
 gemm_op = GemmOp()

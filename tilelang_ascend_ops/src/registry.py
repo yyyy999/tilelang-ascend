@@ -20,8 +20,8 @@ def _ensure_lib_initialized():
     global _lib_def, _lib_impl
     
     if _lib_def is None:
-        _lib_def = torch.library.Library("tilelang_ascend", "DEF")
-        _lib_impl = torch.library.Library("tilelang_ascend", "IMPL")
+        _lib_def = torch.library.Library("tl_ascend_ops", "DEF")
+        _lib_impl = torch.library.Library("tl_ascend_ops", "IMPL")
 
 
 def _register_op(op: BaseOp):
