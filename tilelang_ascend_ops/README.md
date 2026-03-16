@@ -164,7 +164,6 @@ output = kernel(q, k, v)
 | g++ | ✅ | ❌ |
 | torch | ✅ | ✅ |
 | torch_npu | ✅ | ✅ |
-| cloudpickle | ✅ | ✅ |
 
 ## 可用算子
 

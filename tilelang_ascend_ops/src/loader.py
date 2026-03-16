@@ -4,13 +4,12 @@ TileLang Ascend Operators - 独立内核加载器
 不依赖 tilelang 源码，只依赖：
 - torch
 - torch_npu
-- cloudpickle
 """
 
 import os
 import math
+import pickle
 import torch
-import cloudpickle
 import importlib.util
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -42,7 +41,7 @@ class NPUKernelLoader:
         # 加载 metadata
         metadata_path = self.kernel_dir / "metadata.pkl"
         with open(metadata_path, "rb") as f:
-            self.metadata = cloudpickle.load(f)
+            self.metadata = pickle.load(f)
         
         # 提取元数据字段
         self.signature = self.metadata.get("signature", {})

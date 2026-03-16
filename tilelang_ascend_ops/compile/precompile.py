@@ -11,10 +11,11 @@ Usage:
 import os
 import sys
 import shutil
+import pickle
 from pathlib import Path
+from copy import deepcopy
 
 import torch
-import cloudpickle
 
 torch.npu.set_device(0)
 
@@ -27,48 +28,57 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from kernels import KERNEL_REGISTRY
 
 
-def _convert_symbolic_to_pure_python(symbolic):
-    """将 symbolic 中的 TVM tir.Var 转换为纯字符串 key"""
-    result = {}
-    for key, value in symbolic.items():
-        if hasattr(key, 'name'):
-            result[key.name] = value
-        else:
-            result[str(key)] = value
-    return result
-
-
-def _convert_shape_to_pure_python(shape):
-    """将 shape 中的 TVM tir.Var 转换为字符串或整数"""
-    result = []
-    for dim in shape:
-        if hasattr(dim, 'name'):
-            result.append(dim.name)
-        elif hasattr(dim, 'value'):
-            result.append(int(dim.value))
-        elif isinstance(dim, int):
-            result.append(dim)
-        elif isinstance(dim, str):
-            result.append(dim)
-        else:
-            try:
-                result.append(int(dim))
-            except (ValueError, TypeError):
-                result.append(str(dim))
-    return result
-
-
-def _convert_param_info_to_pure_python(param_info):
-    """将 param_info 中的 TVM 对象转换为纯 Python 对象"""
-    result = []
-    for info in param_info:
-        new_info = {
-            'dtype': info['dtype'],
-            'shape': _convert_shape_to_pure_python(info['shape']),
-            'is_output': info['is_output'],
+def _to_pure_python(obj):
+    """
+    递归转换 TVM 类型为纯 Python 类型
+    
+    保留不涉及 TVM 依赖的类型（如 torch.dtype）
+    """
+    if obj is None:
+        return None
+    
+    # 基本类型直接返回
+    if isinstance(obj, (bool, int, float, str)):
+        return obj
+    
+    # bytes 直接返回
+    if isinstance(obj, bytes):
+        return obj
+    
+    # torch.dtype 直接返回（不涉及 TVM 依赖）
+    if isinstance(obj, torch.dtype):
+        return obj
+    
+    # TVM IntImm -> int
+    if hasattr(obj, 'value') and not isinstance(obj, (bool, int, float, str, torch.dtype)):
+        try:
+            return int(obj.value)
+        except:
+            pass
+    
+    # TVM tir.Var -> str (变量名)
+    if hasattr(obj, 'name') and not isinstance(obj, (bool, int, float, str, torch.dtype)):
+        try:
+            return str(obj.name)
+        except:
+            pass
+    
+    # 列表/元组 -> 递归转换
+    if isinstance(obj, (list, tuple)):
+        return [_to_pure_python(item) for item in obj]
+    
+    # 字典 -> 递归转换
+    if isinstance(obj, dict):
+        return {
+            _to_pure_python(k): _to_pure_python(v)
+            for k, v in obj.items()
         }
-        result.append(new_info)
-    return result
+    
+    # 其他类型尝试转字符串
+    try:
+        return str(obj)
+    except:
+        return None
 
 
 def save_kernel(kernel, name: str):
@@ -78,32 +88,35 @@ def save_kernel(kernel, name: str):
     
     print(f"\n保存内核到: {kernel_dir}")
     
-    symbolic_pure = _convert_symbolic_to_pure_python(kernel.symbolic)
-    param_info_pure = _convert_param_info_to_pure_python(kernel.param_info)
-    
+    # 深度转换所有字段为纯 Python 类型
     metadata = {
-        "symbolic": symbolic_pure,
-        "out_idx": kernel.out_idx,
-        "param_info": param_info_pure,
-        "signature": kernel.signature,
-        "shared": kernel.utils_shared,
-        "kernel_name": kernel.kernel_name,
-        "gridfunc": kernel.gridfunc,
-        "mix_mode": kernel.mix_mode,
-        "name": kernel.utils_name,
-        "tensor_kinds": kernel.tensor_kinds,
-        "kernel_src": kernel.utils_kernel_src,
+        "symbolic": _to_pure_python(kernel.symbolic),
+        "out_idx": _to_pure_python(kernel.out_idx),
+        "param_info": _to_pure_python(kernel.param_info),
+        "signature": _to_pure_python(kernel.signature),
+        "shared": _to_pure_python(kernel.utils_shared),
+        "kernel_name": _to_pure_python(kernel.kernel_name),
+        "gridfunc": _to_pure_python(kernel.gridfunc),
+        "mix_mode": _to_pure_python(kernel.mix_mode),
+        "name": _to_pure_python(kernel.utils_name),
+        "tensor_kinds": _to_pure_python(kernel.tensor_kinds),
+        "kernel_src": _to_pure_python(kernel.utils_kernel_src),
     }
+    
+    # 打印转换后的内容用于调试
+    print(f"  symbolic: {metadata['symbolic']}")
+    print(f"  out_idx: {metadata['out_idx']}")
+    print(f"  param_info: {metadata['param_info']}")
     
     metadata_path = kernel_dir / "metadata.pkl"
     with open(metadata_path, "wb") as f:
-        cloudpickle.dump(metadata, f)
-    print(f"  ✓ 保存 metadata.pkl")
+        pickle.dump(metadata, f)
+    print(f"  ✓ 保存 metadata.pkl (使用标准 pickle)")
     
     # .so 文件在当前工作目录
     cwd = Path(os.getcwd())
     
-    # 复制 main.so (启动器) - 使用 kernel.so_launcher_path
+    # 复制 main.so (启动器)
     launcher_so_path = cwd / kernel.so_launcher_path
     
     if launcher_so_path.exists():
@@ -113,7 +126,7 @@ def save_kernel(kernel, name: str):
         print(f"  ✗ 错误: 找不到 {launcher_so_path}")
         print(f"    当前目录 .so 文件: {list(cwd.glob('*.so'))}")
     
-    # 复制 npu_utils.so (工具库) - 使用 kernel.so_utils_path
+    # 复制 npu_utils.so (工具库)
     utils_so_path = cwd / kernel.so_utils_path
     
     if utils_so_path.exists():

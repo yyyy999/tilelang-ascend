@@ -4,7 +4,6 @@ TileLang Ascend Operators - 安装配置
 纯 Python 包，依赖：
 - torch >= 2.0.0
 - torch_npu
-- cloudpickle
 """
 
 from setuptools import setup, find_packages
@@ -38,7 +37,6 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "torch>=2.0.0",
-        "cloudpickle",
     ],
     extras_require={
         "npu": ["torch_npu"],
