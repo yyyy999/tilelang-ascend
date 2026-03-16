@@ -45,7 +45,8 @@ class NPUKernelLoader:
         
         # 提取元数据字段
         self.signature = self.metadata.get("signature", {})
-        self.out_idx = self.metadata.get("out_idx", [-1])
+        self.out_idx = self.metadata.get("out_idx", None)
+        # 保留 None，只转换 int 为 list
         if isinstance(self.out_idx, int):
             self.out_idx = [self.out_idx]
         self.param_info = self.metadata.get("param_info", [])
@@ -152,7 +153,7 @@ class NPUKernelLoader:
     def __call__(self, *args) -> Any:
         """执行内核"""
         total_params = len(self.param_info)
-        num_inputs = total_params - len(self.out_idx)
+        num_inputs = total_params - (len(self.out_idx) if self.out_idx is not None else 0)
         
         if len(args) != num_inputs:
             raise ValueError(f"Expected {num_inputs} inputs, got {len(args)}")
@@ -211,7 +212,9 @@ class NPUKernelLoader:
         )
         
         # 返回结果
-        if len(self.out_idx) == 1:
+        if self.out_idx is None:
+            return None
+        elif len(self.out_idx) == 1:
             return full_args[self.out_idx[0]]
         else:
             return [full_args[i] for i in self.out_idx]
