@@ -6,8 +6,8 @@
 
 - ✅ **离线安装即用** - 无需编译器，安装后直接使用
 - ✅ **独立运行时** - 不依赖 tilelang 源码
-- ✅ **动态 Shape** - 使用 `T.symbolic()` 支持多种 shape
-- ✅ **PyTorch 集成** - 支持 `torch.ops.tilelang_ascend.xxx` 调用
+- ✅ **PyTorch 集成** - 支持 `torch.ops.tl_ascend_ops.xxx` 调用
+- ✅ **torch_npu 注入** - 支持 `torch_npu.xxx` 调用
 
 ## 安装
 
@@ -16,42 +16,62 @@
 - Python >= 3.8
 - PyTorch >= 2.0.0
 - torch_npu
-- cloudpickle
 
-### 安装步骤
+### 方式一：从 wheel 包安装（推荐）
+
+```bash
+# 安装预编译的 wheel 包
+pip install tl_ascend_ops-0.1.0-py3-none-any.whl
+```
+
+### 方式二：从源码安装
 
 ```bash
 cd tilelang_ascend_ops
-pip install .
+pip install -e .
 ```
 
 ## 使用方法
 
-### 方式一：直接调用函数
+### 方式一：通过包调用
 
 ```python
 import torch
-import tilelang_ascend_ops
+import tl_ascend_ops
 
-q = torch.randn(512, 128, dtype=torch.float16).npu()
-k = torch.randn(512, 128, dtype=torch.float16).npu()
-v = torch.randn(512, 128, dtype=torch.float16).npu()
+q = torch.randn(512, 128, dtype=torch.float16, device="npu")
+k = torch.randn(512, 128, dtype=torch.float16, device="npu")
+v = torch.randn(512, 128, dtype=torch.float16, device="npu")
 
-output = tilelang_ascend_ops.flash_attention(q, k, v)
+output = tl_ascend_ops.flash_attention(q, k, v)
 ```
 
-### 方式二：使用 torch.ops 接口
+### 方式二：通过 torch_npu 调用
 
 ```python
 import torch
-import tilelang_ascend_ops
+import torch_npu
+import tl_ascend_ops  # 需要先导入以触发注入
 
-q = torch.randn(512, 128, dtype=torch.float16).npu()
-k = torch.randn(512, 128, dtype=torch.float16).npu()
-v = torch.randn(512, 128, dtype=torch.float16).npu()
+q = torch.randn(512, 128, dtype=torch.float16, device="npu")
+k = torch.randn(512, 128, dtype=torch.float16, device="npu")
+v = torch.randn(512, 128, dtype=torch.float16, device="npu")
+
+output = torch_npu.flash_attention(q, k, v)
+```
+
+### 方式三：通过 torch.ops 调用
+
+```python
+import torch
+import tl_ascend_ops
+
+q = torch.randn(512, 128, dtype=torch.float16, device="npu")
+k = torch.randn(512, 128, dtype=torch.float16, device="npu")
+v = torch.randn(512, 128, dtype=torch.float16, device="npu")
 
 scale = 1.0 / (128 ** 0.5)
-output = torch.ops.tilelang_ascend.flash_attention(q, k, v, scale)
+output = torch.ops.tl_ascend_ops.flash_attention(q, k, v, scale)
 ```
 
 ## 开发指南
@@ -62,33 +82,52 @@ output = torch.ops.tilelang_ascend.flash_attention(q, k, v, scale)
 
 ```bash
 cd tilelang_ascend_ops
-python scripts/precompile.py
+python compile/precompile.py
 ```
 
-预编译产物会保存到 `tilelang_ascend_ops/kernels/` 目录。
+预编译产物会保存到 `src/kernels/` 目录。
 
 ### 打包发布
 
 ```bash
+cd tilelang_ascend_ops
+
+# 方式一：使用 pip wheel
+pip wheel . --no-deps -w dist/
+
+# 方式二：使用 build
+pip install build
 python -m build --wheel
 ```
+
+打包后的 wheel 文件在 `dist/` 目录下。
 
 ### 目录结构
 
 ```
 tilelang_ascend_ops/
-├── tilelang_ascend_ops/
-│   ├── __init__.py       # 算子注册
-│   ├── loader.py         # 独立内核加载器
-│   └── kernels/          # 预编译内核
+├── src/                    # 包源码 (tl_ascend_ops 包)
+│   ├── __init__.py         # 包入口，算子注入
+│   ├── loader.py           # 独立内核加载器
+│   ├── registry.py         # 算子注册中心
+│   ├── ops/                # 算子定义
+│   │   ├── base.py         # 基类
+│   │   ├── flash_attention.py
+│   │   └── gemm.py
+│   └── kernels/            # 预编译内核
 │       └── flash_attention/
 │           ├── metadata.pkl    # 内核元数据
 │           ├── main.so         # 启动器
 │           └── npu_utils.so    # 工具库
-├── scripts/
-│   └── precompile.py     # 预编译脚本
-├── setup.py
-├── test_install.py
+├── compile/                # 编译脚本
+│   ├── precompile.py       # 预编译脚本
+│   └── kernels/            # 内核定义
+│       ├── flash_attention.py
+│       └── gemm.py
+├── tests/                  # 测试文件
+│   ├── test_flash_attention.py
+│   └── test_gemm.py
+├── setup.py                # 安装配置
 └── README.md
 ```
 
@@ -99,7 +138,7 @@ tilelang_ascend_ops/
 `loader.py` 实现了独立的内核加载器，不依赖 tilelang 源码：
 
 ```python
-from tilelang_ascend_ops.loader import KernelRegistry
+from tl_ascend_ops.loader import KernelRegistry
 
 # 加载预编译内核
 kernel = KernelRegistry.get_kernel("flash_attention")
@@ -126,6 +165,12 @@ output = kernel(q, k, v)
 | torch | ✅ | ✅ |
 | torch_npu | ✅ | ✅ |
 | cloudpickle | ✅ | ✅ |
+
+## 可用算子
+
+| 算子 | Shape | 说明 |
+|------|-------|------|
+| `flash_attention` | 固定 (512, 128) | Flash Attention |
 
 ## License
 
