@@ -5,7 +5,7 @@ Manages PyTorch registration for all operators.
 """
 
 import torch
-from typing import Dict, List
+from typing import Dict
 from .loader import KernelRegistry
 from .ops.base import BaseOp
 

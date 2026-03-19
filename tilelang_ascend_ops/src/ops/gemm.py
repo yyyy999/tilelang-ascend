@@ -60,7 +60,7 @@ class GemmOp(BaseOp):
             raise ValueError(f"Matrix dimension mismatch: A.shape[1]={K} != B.shape[0]={K2}")
         
         if C is None:
-            C = torch.randn(M, N, dtype=torch.float16, device=A.device)
+            C = torch.empty(M, N, dtype=torch.float16, device=A.device)
         elif C.device.type != "npu":
             raise ValueError("C must be an NPU tensor")
         elif C.shape != (M, N):

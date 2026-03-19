@@ -20,8 +20,8 @@ Usage:
     c = torch_npu.gemm(a, b)
     
     # Method 3: Call via torch.ops
-    output = torch.ops.tilelang_ascend.flash_attention(q, k, v, scale)
-    torch.ops.tilelang_ascend.gemm(a, b, c)
+    output = torch.ops.tl_ascend_ops.flash_attention(q, k, v, scale)
+    torch.ops.tl_ascend_ops.gemm(a, b, c)
 """
 
 from .loader import KernelRegistry

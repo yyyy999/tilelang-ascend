@@ -12,7 +12,7 @@ import pickle
 import torch
 import importlib.util
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional
 
 
 def replace_by_longest_key(calculate_str: str, replace_dict: dict) -> str:

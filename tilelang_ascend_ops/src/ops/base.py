@@ -5,7 +5,7 @@ All operators need to inherit from this base class and implement the required me
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Optional
 import torch
 
 
@@ -38,8 +38,3 @@ class BaseOp(ABC):
     def python_api(self, *args, **kwargs) -> torch.Tensor:
         """Python API interface, includes parameter validation and default value handling"""
         pass
-    
-    def register(self, lib_def, lib_impl, registry, dispatch_key: str = "PrivateUse1"):
-        """Register operator to PyTorch"""
-        lib_def.define(self.signature)
-        lib_impl.impl(self.name, self.impl, dispatch_key)
