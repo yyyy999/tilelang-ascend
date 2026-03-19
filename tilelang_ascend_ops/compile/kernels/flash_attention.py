@@ -1,8 +1,8 @@
 """
-Flash Attention 内核定义
+Flash Attention Kernel Definition
 
-固定 shape: seq_len=512, dim=128
-使用 online softmax 算法
+Fixed shape: seq_len=512, dim=128
+Uses online softmax algorithm
 """
 
 import os
@@ -15,9 +15,9 @@ dim = 128
 
 
 def compile_flash_attention_kernel():
-    """编译 Flash Attention 内核"""
+    """Compile Flash Attention kernel"""
     print("=" * 60)
-    print("编译 Flash Attention 内核")
+    print("Compiling Flash Attention kernel")
     print("=" * 60)
     
     os.environ['TILELANG_ASCEND_MODE'] = 'Developer'
@@ -96,15 +96,15 @@ def compile_flash_attention_kernel():
 
         return flash_attention
     
-    print("正在编译...")
+    print("Compiling...")
     kernel = online_flash_attention()
     
-    print(f"Kernel 编译完成")
+    print(f"Kernel compilation completed")
     print(f"  - symbolic: {kernel.symbolic}")
     print(f"  - param_info: {kernel.param_info}")
     print(f"  - out_idx: {kernel.out_idx}")
     
-    print("\n测试运行...")
+    print("\nRunning test...")
     q = torch.randn(seq_len, dim, dtype=torch.float16, device="npu")
     k = torch.randn(seq_len, dim, dtype=torch.float16, device="npu")
     v = torch.randn(seq_len, dim, dtype=torch.float16, device="npu")
@@ -117,6 +117,6 @@ def compile_flash_attention_kernel():
     ).to(torch.float16) @ v
     
     torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
-    print("✓ 验证通过")
+    print("✓ Verification passed")
     
     return kernel

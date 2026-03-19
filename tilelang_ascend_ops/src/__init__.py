@@ -1,25 +1,25 @@
 """
 TileLang Ascend Operators Package
 
-提供 PyTorch 算子接口，支持离线安装即用。
+Provides PyTorch operator interfaces with offline installation support.
 
-依赖：
+Dependencies:
 - torch >= 2.0.0
 - torch_npu
 
-使用方式：
+Usage:
     import tilelang_ascend_ops
     
-    # 方式 1: 通过包调用
+    # Method 1: Call via package
     output = tilelang_ascend_ops.flash_attention(q, k, v)
     c = tilelang_ascend_ops.gemm(a, b)
     
-    # 方式 2: 通过 torch_npu 调用
+    # Method 2: Call via torch_npu
     import torch_npu
     output = torch_npu.flash_attention(q, k, v)
     c = torch_npu.gemm(a, b)
     
-    # 方式 3: 通过 torch.ops 调用
+    # Method 3: Call via torch.ops
     output = torch.ops.tilelang_ascend.flash_attention(q, k, v, scale)
     torch.ops.tilelang_ascend.gemm(a, b, c)
 """
@@ -29,23 +29,23 @@ from .registry import register_all_ops, get_kernel_registry
 
 __version__ = "0.1.0"
 
-# 注册所有算子
+# Register all operators
 _registered_ops = register_all_ops()
 
-# 导入算子 Python API
+# Import operator Python APIs
 from .ops.flash_attention import flash_attention_op
 from .ops.gemm import gemm_op
 
 flash_attention = flash_attention_op.python_api
 gemm = gemm_op.python_api
 
-# 注入到 torch_npu 模块
+# Inject into torch_npu module
 def _inject_to_torch_npu():
-    """将算子接口注入到 torch_npu 模块"""
+    """Inject operator interfaces into torch_npu module"""
     try:
         import torch_npu
         
-        # 动态注入所有已注册的算子
+        # Dynamically inject all registered operators
         injected_ops = []
         for op_name, op in _registered_ops.items():
             op_func = getattr(op, 'python_api', None)
@@ -54,9 +54,9 @@ def _inject_to_torch_npu():
                 injected_ops.append(op_name)
         
         torch_npu.KernelRegistry = KernelRegistry
-        print(f"✓ 已注入算子到 torch_npu: {', '.join(injected_ops)}")
+        print(f"✓ Injected operators into torch_npu: {', '.join(injected_ops)}")
     except ImportError:
-        print(f"⚠ torch_npu 未安装，跳过注入")
+        print(f"⚠ torch_npu not installed, skipping injection")
 
 _inject_to_torch_npu()
 
@@ -70,4 +70,4 @@ __all__ = [
     "get_kernel_registry",
 ]
 
-print(f"✓ tilelang_ascend_ops 加载完成")
+print(f"✓ tilelang_ascend_ops loaded successfully")

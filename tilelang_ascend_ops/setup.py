@@ -1,7 +1,7 @@
 """
-TileLang Ascend Operators - 安装配置
+TileLang Ascend Operators - Installation Configuration
 
-纯 Python 包，依赖：
+Pure Python package, dependencies:
 - torch >= 2.0.0
 - torch_npu
 """
@@ -20,7 +20,7 @@ setup(
     version=VERSION,
     author="TileLang Ascend Team",
     author_email="tilelang@example.com",
-    description="PyTorch operators for TileLang Ascend kernels - 离线安装即用",
+    description="PyTorch operators for TileLang Ascend kernels - offline installation ready",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/tilelang/tilelang-ascend",

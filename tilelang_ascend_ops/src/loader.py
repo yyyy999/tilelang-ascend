@@ -1,7 +1,7 @@
 """
-TileLang Ascend Operators - 独立内核加载器
+TileLang Ascend Operators - Standalone Kernel Loader
 
-不依赖 tilelang 源码，只依赖：
+Does not depend on tilelang source code, only depends on:
 - torch
 - torch_npu
 """
@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Union
 
 
 def replace_by_longest_key(calculate_str: str, replace_dict: dict) -> str:
-    """替换字符串中的变量名"""
+    """Replace variable names in string"""
     sorted_keys = sorted(replace_dict.keys(), key=lambda x: (-len(x), x))
     result = calculate_str
     for key in sorted_keys:
@@ -26,27 +26,27 @@ def replace_by_longest_key(calculate_str: str, replace_dict: dict) -> str:
 
 class NPUKernelLoader:
     """
-    独立的 NPU 内核加载器
+    Standalone NPU Kernel Loader
     
-    从预编译的文件加载内核：
-    - metadata.pkl: 内核元数据
-    - main.so: 启动器
-    - npu_utils.so: 工具库
-    - kernel.o: 内核二进制（可选，嵌入在 metadata 中）
+    Loads kernels from precompiled files:
+    - metadata.pkl: Kernel metadata
+    - main.so: Launcher
+    - npu_utils.so: Utility library
+    - kernel.o: Kernel binary (optional, embedded in metadata)
     """
     
     def __init__(self, kernel_dir: str):
         self.kernel_dir = Path(kernel_dir)
         
-        # 加载 metadata
+        # Load metadata
         metadata_path = self.kernel_dir / "metadata.pkl"
         with open(metadata_path, "rb") as f:
             self.metadata = pickle.load(f)
         
-        # 提取元数据字段
+        # Extract metadata fields
         self.signature = self.metadata.get("signature", {})
         self.out_idx = self.metadata.get("out_idx", None)
-        # 保留 None，只转换 int 为 list
+        # Keep None, only convert int to list
         if isinstance(self.out_idx, int):
             self.out_idx = [self.out_idx]
         self.param_info = self.metadata.get("param_info", [])
@@ -58,21 +58,21 @@ class NPUKernelLoader:
         self.shared = self.metadata.get("shared", 1)
         self.mix_mode = self.metadata.get("mix_mode", False)
         
-        # 设备信息
+        # Device info
         self.device = torch.npu.current_device()
         self.stream = torch.npu.current_stream(self.device).npu_stream
         
-        # 加载 main.so (启动器)
+        # Load main.so (launcher)
         self._load_launcher()
         
-        # 加载 npu_utils.so (工具库)
+        # Load npu_utils.so (utility library)
         self._load_npu_utils()
         
-        # 加载内核二进制
+        # Load kernel binary
         self._load_kernel_binary()
     
     def _load_launcher(self):
-        """加载 main.so 启动器"""
+        """Load main.so launcher"""
         launcher_path = self.kernel_dir / "main.so"
         spec = importlib.util.spec_from_file_location(
             "__tilelang_launcher", str(launcher_path)
@@ -82,7 +82,7 @@ class NPUKernelLoader:
         self.launch = getattr(mod, "launch")
     
     def _load_npu_utils(self):
-        """加载 npu_utils.so 工具库"""
+        """Load npu_utils.so utility library"""
         utils_path = self.kernel_dir / "npu_utils.so"
         spec = importlib.util.spec_from_file_location(
             "npu_utils", str(utils_path)
@@ -91,7 +91,7 @@ class NPUKernelLoader:
         spec.loader.exec_module(self.npu_utils)
     
     def _load_kernel_binary(self):
-        """加载内核二进制到设备"""
+        """Load kernel binary to device"""
         kernel_mode = "aicore" if not self.mix_mode else "aiv"
         
         result = self.npu_utils.load_kernel_binary(
@@ -105,7 +105,7 @@ class NPUKernelLoader:
         self.t_module, self.t_function, self.t_n_regs, self.t_n_spills = result
     
     def _calc_grid(self, orig_to_input: dict, *args):
-        """计算 grid 维度和动态值"""
+        """Calculate grid dimensions and dynamic values"""
         dynamic_val = {}
         extra_args = []
         
@@ -126,7 +126,7 @@ class NPUKernelLoader:
         
         self.extra_args = extra_args
         
-        # 计算 grid
+        # Calculate grid
         result = replace_by_longest_key(self.gridfunc, dynamic_val)
         
         try:
@@ -151,14 +151,14 @@ class NPUKernelLoader:
         return dynamic_val
     
     def __call__(self, *args) -> Any:
-        """执行内核"""
+        """Execute kernel"""
         total_params = len(self.param_info)
         num_inputs = total_params - (len(self.out_idx) if self.out_idx is not None else 0)
         
         if len(args) != num_inputs:
             raise ValueError(f"Expected {num_inputs} inputs, got {len(args)}")
         
-        # 构建输入位置映射
+        # Build input position mapping
         orig_to_input = {}
         input_pos = 0
         for i, info in enumerate(self.param_info):
@@ -166,16 +166,16 @@ class NPUKernelLoader:
                 orig_to_input[i] = input_pos
                 input_pos += 1
         
-        # 计算 grid 和动态值
+        # Calculate grid and dynamic values
         dynamic_val = self._calc_grid(orig_to_input, *args)
         
-        # 构建完整参数列表
+        # Build complete parameter list
         full_args = [None] * total_params
         input_ptr = 0
         
         for i, info in enumerate(self.param_info):
             if info["is_output"]:
-                # 输出参数：创建空张量
+                # Output parameter: create empty tensor
                 dtype = info["dtype"]
                 shape = []
                 for dim in info["shape"]:
@@ -190,14 +190,14 @@ class NPUKernelLoader:
                 device = args[0].device if args else torch.device("npu")
                 full_args[i] = torch.empty(shape, dtype=dtype, device=device)
             else:
-                # 输入参数
+                # Input parameter
                 full_args[i] = args[input_ptr]
                 input_ptr += 1
         
-        # 添加额外参数
+        # Add extra parameters
         full_args.extend(self.extra_args)
         
-        # 执行内核
+        # Execute kernel
         self.launch(
             self.grid[0],
             self.grid[1],
@@ -211,7 +211,7 @@ class NPUKernelLoader:
             *full_args
         )
         
-        # 返回结果
+        # Return result
         if self.out_idx is None:
             return None
         elif len(self.out_idx) == 1:
@@ -221,22 +221,22 @@ class NPUKernelLoader:
 
 
 class KernelRegistry:
-    """内核注册表"""
+    """Kernel registry"""
     
     _kernels: Dict[str, NPUKernelLoader] = {}
     _kernel_dir: Optional[Path] = None
     
     @classmethod
     def set_kernel_dir(cls, kernel_dir: str):
-        """设置内核目录"""
+        """Set kernel directory"""
         cls._kernel_dir = Path(kernel_dir)
     
     @classmethod
     def get_kernel(cls, name: str) -> NPUKernelLoader:
-        """获取内核（带缓存）"""
+        """Get kernel (with cache)"""
         if name not in cls._kernels:
             if cls._kernel_dir is None:
-                # 默认使用包内的 kernels 目录
+                # Default to kernels directory in package
                 cls._kernel_dir = Path(__file__).parent / "kernels"
             
             kernel_path = cls._kernel_dir / name

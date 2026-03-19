@@ -1,7 +1,7 @@
 """
-Flash Attention 算子定义
+Flash Attention Operator Definition
 
-固定 shape: seq_len=512, dim=128
+Fixed shape: seq_len=512, dim=128
 """
 
 from typing import Optional
@@ -10,7 +10,7 @@ from .base import BaseOp
 
 
 class FlashAttentionOp(BaseOp):
-    """Flash Attention 算子"""
+    """Flash Attention operator"""
     
     _kernel = None
     
@@ -40,16 +40,16 @@ class FlashAttentionOp(BaseOp):
         scale: Optional[float] = None,
     ) -> torch.Tensor:
         """
-        Flash Attention 算子
+        Flash Attention operator
         
         Args:
-            Q: Query 张量 [seq_len, dim], NPU tensor, float16
-            K: Key 张量 [seq_len, dim], NPU tensor, float16
-            V: Value 张量 [seq_len, dim], NPU tensor, float16
-            scale: 缩放因子 (默认: 1/sqrt(dim))
+            Q: Query tensor [seq_len, dim], NPU tensor, float16
+            K: Key tensor [seq_len, dim], NPU tensor, float16
+            V: Value tensor [seq_len, dim], NPU tensor, float16
+            scale: Scale factor (default: 1/sqrt(dim))
         
         Returns:
-            Output 张量 [seq_len, dim]
+            Output tensor [seq_len, dim]
         """
         if Q.device.type != "npu":
             raise ValueError("Q must be an NPU tensor")

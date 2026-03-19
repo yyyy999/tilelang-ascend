@@ -1,7 +1,7 @@
 """
-TileLang 内核定义目录
+TileLang Kernel Definitions Directory
 
-每个内核定义在单独的文件中，便于维护和扩展。
+Each kernel is defined in a separate file for easy maintenance and extension.
 """
 
 from .flash_attention import compile_flash_attention_kernel

@@ -1,11 +1,11 @@
 """
-TileLang Ascend Operators - 预编译脚本
+TileLang Ascend Operators - Precompile Script
 
-编译所有算子内核并保存到 kernels 目录。
+Compiles all operator kernels and saves them to the kernels directory.
 
 Usage:
-    python compile/precompile.py              # 编译所有内核
-    python compile/precompile.py flash_attention  # 只编译指定内核
+    python compile/precompile.py              # Compile all kernels
+    python compile/precompile.py flash_attention  # Compile only specified kernel
 """
 
 import os
@@ -30,22 +30,22 @@ from kernels import KERNEL_REGISTRY
 
 def _to_pure_python(obj):
     """
-    递归转换 TVM 类型为纯 Python 类型
+    Recursively convert TVM types to pure Python types
     
-    保留不涉及 TVM 依赖的类型（如 torch.dtype）
+    Preserves types that don't involve TVM dependencies (e.g. torch.dtype)
     """
     if obj is None:
         return None
     
-    # 基本类型直接返回
+    # Return basic types directly
     if isinstance(obj, (bool, int, float, str)):
         return obj
     
-    # bytes 直接返回
+    # Return bytes directly
     if isinstance(obj, bytes):
         return obj
     
-    # torch.dtype 直接返回（不涉及 TVM 依赖）
+    # Return torch.dtype directly (no TVM dependency)
     if isinstance(obj, torch.dtype):
         return obj
     
@@ -56,25 +56,25 @@ def _to_pure_python(obj):
         except:
             pass
     
-    # TVM tir.Var -> str (变量名)
+    # TVM tir.Var -> str (variable name)
     if hasattr(obj, 'name') and not isinstance(obj, (bool, int, float, str, torch.dtype)):
         try:
             return str(obj.name)
         except:
             pass
     
-    # 列表/元组 -> 递归转换
+    # list/tuple -> recursive conversion
     if isinstance(obj, (list, tuple)):
         return [_to_pure_python(item) for item in obj]
     
-    # 字典 -> 递归转换
+    # dict -> recursive conversion
     if isinstance(obj, dict):
         return {
             _to_pure_python(k): _to_pure_python(v)
             for k, v in obj.items()
         }
     
-    # 其他类型尝试转字符串
+    # Try to convert other types to string
     try:
         return str(obj)
     except:
@@ -82,13 +82,13 @@ def _to_pure_python(obj):
 
 
 def save_kernel(kernel, name: str):
-    """保存内核到 kernels 目录"""
+    """Save kernel to kernels directory"""
     kernel_dir = KERNELS_DIR / name
     kernel_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"\n保存内核到: {kernel_dir}")
+    print(f"\nSaving kernel to: {kernel_dir}")
     
-    # 深度转换所有字段为纯 Python 类型
+    # Deep convert all fields to pure Python types
     metadata = {
         "symbolic": _to_pure_python(kernel.symbolic),
         "out_idx": _to_pure_python(kernel.out_idx),
@@ -103,7 +103,7 @@ def save_kernel(kernel, name: str):
         "kernel_src": _to_pure_python(kernel.utils_kernel_src),
     }
     
-    # 打印转换后的内容用于调试
+    # Print converted content for debugging
     print(f"  symbolic: {metadata['symbolic']}")
     print(f"  out_idx: {metadata['out_idx']}")
     print(f"  param_info: {metadata['param_info']}")
@@ -111,38 +111,38 @@ def save_kernel(kernel, name: str):
     metadata_path = kernel_dir / "metadata.pkl"
     with open(metadata_path, "wb") as f:
         pickle.dump(metadata, f)
-    print(f"  ✓ 保存 metadata.pkl (使用标准 pickle)")
+    print(f"  ✓ Saved metadata.pkl (using standard pickle)")
     
-    # .so 文件在当前工作目录
+    # .so files are in current working directory
     cwd = Path(os.getcwd())
     
-    # 复制 main.so (启动器)
+    # Copy main.so (launcher)
     launcher_so_path = cwd / kernel.so_launcher_path
     
     if launcher_so_path.exists():
         shutil.copy(launcher_so_path, kernel_dir / "main.so")
-        print(f"  ✓ 保存 main.so (from {launcher_so_path})")
+        print(f"  ✓ Saved main.so (from {launcher_so_path})")
     else:
-        print(f"  ✗ 错误: 找不到 {launcher_so_path}")
-        print(f"    当前目录 .so 文件: {list(cwd.glob('*.so'))}")
+        print(f"  ✗ Error: Cannot find {launcher_so_path}")
+        print(f"    .so files in current directory: {list(cwd.glob('*.so'))}")
     
-    # 复制 npu_utils.so (工具库)
+    # Copy npu_utils.so (utility library)
     utils_so_path = cwd / kernel.so_utils_path
     
     if utils_so_path.exists():
         shutil.copy(utils_so_path, kernel_dir / "npu_utils.so")
-        print(f"  ✓ 保存 npu_utils.so (from {utils_so_path})")
+        print(f"  ✓ Saved npu_utils.so (from {utils_so_path})")
     else:
-        print(f"  ✗ 错误: 找不到 {utils_so_path}")
-        print(f"    当前目录文件: {list(cwd.glob('*.so'))}")
+        print(f"  ✗ Error: Cannot find {utils_so_path}")
+        print(f"    Files in current directory: {list(cwd.glob('*.so'))}")
 
 
 def main():
-    print("TileLang Ascend Operators - 预编译脚本")
+    print("TileLang Ascend Operators - Precompile Script")
     print("=" * 60)
-    print(f"可用内核: {list(KERNEL_REGISTRY.keys())}")
-    print(f"当前工作目录: {os.getcwd()}")
-    print(f"内核输出目录: {KERNELS_DIR}")
+    print(f"Available kernels: {list(KERNEL_REGISTRY.keys())}")
+    print(f"Current working directory: {os.getcwd()}")
+    print(f"Kernel output directory: {KERNELS_DIR}")
     print("=" * 60)
     
     if len(sys.argv) > 1:
@@ -150,7 +150,7 @@ def main():
     else:
         kernels_to_compile = list(KERNEL_REGISTRY.keys())
     
-    print(f"将编译: {kernels_to_compile}")
+    print(f"Will compile: {kernels_to_compile}")
     
     if KERNELS_DIR.exists():
         shutil.rmtree(KERNELS_DIR)
@@ -159,7 +159,7 @@ def main():
     success_kernels = []
     for name in kernels_to_compile:
         if name not in KERNEL_REGISTRY:
-            print(f"警告: 未知内核 '{name}'，跳过")
+            print(f"Warning: Unknown kernel '{name}', skipping")
             continue
         
         try:
@@ -168,15 +168,15 @@ def main():
             save_kernel(kernel, name)
             success_kernels.append(name)
         except Exception as e:
-            print(f"错误: 编译 '{name}' 失败: {e}")
+            print(f"Error: Failed to compile '{name}': {e}")
             import traceback
             traceback.print_exc()
     
     print("\n" + "=" * 60)
-    print(f"✓ 预编译完成！成功: {success_kernels}")
-    print(f"内核目录: {KERNELS_DIR}")
+    print(f"✓ Precompilation completed! Successful: {success_kernels}")
+    print(f"Kernel directory: {KERNELS_DIR}")
     
-    # 列出生成的文件
+    # List generated files
     for name in success_kernels:
         kernel_dir = KERNELS_DIR / name
         files = list(kernel_dir.glob("*"))

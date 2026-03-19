@@ -1,7 +1,7 @@
 """
-TileLang Ascend Operators - 算子注册中心
+TileLang Ascend Operators - Operator Registry
 
-管理所有算子的 PyTorch 注册。
+Manages PyTorch registration for all operators.
 """
 
 import torch
@@ -16,7 +16,7 @@ _lib_impl = None
 
 
 def _ensure_lib_initialized():
-    """确保 PyTorch 算子库已初始化"""
+    """Ensure PyTorch operator library is initialized"""
     global _lib_def, _lib_impl
     
     if _lib_def is None:
@@ -25,7 +25,7 @@ def _ensure_lib_initialized():
 
 
 def _register_op(op: BaseOp):
-    """注册单个算子到 PyTorch"""
+    """Register a single operator to PyTorch"""
     _ensure_lib_initialized()
     
     _lib_def.define(op.signature)
@@ -37,7 +37,7 @@ def _register_op(op: BaseOp):
 
 
 def register_all_ops() -> Dict[str, BaseOp]:
-    """注册所有算子"""
+    """Register all operators"""
     from .ops.flash_attention import flash_attention_op
     from .ops.gemm import gemm_op
     
@@ -49,10 +49,10 @@ def register_all_ops() -> Dict[str, BaseOp]:
     for name, op in ops.items():
         _register_op(op)
     
-    print(f"✓ 已注册 {len(ops)} 个算子: {', '.join(ops.keys())}")
+    print(f"✓ Registered {len(ops)} operators: {', '.join(ops.keys())}")
     return ops
 
 
 def get_kernel_registry():
-    """获取内核注册中心"""
+    """Get kernel registry"""
     return _kernel_registry

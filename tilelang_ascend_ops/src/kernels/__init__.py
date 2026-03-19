@@ -1,5 +1,5 @@
 """
-预编译内核目录
+Precompiled Kernel Directory
 
-此目录包含预编译的内核文件，打包时会被包含在 wheel 中。
+This directory contains precompiled kernel files that will be included in the wheel package.
 """

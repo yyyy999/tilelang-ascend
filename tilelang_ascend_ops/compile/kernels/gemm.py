@@ -1,7 +1,7 @@
 """
-动态shape GEMM 内核定义
+Dynamic Shape GEMM Kernel Definition
 
-支持任意 M, N, K 维度的矩阵乘法
+Supports arbitrary M, N, K dimensions for matrix multiplication
 """
 
 import os
@@ -11,9 +11,9 @@ import tilelang.language as T
 
 
 def compile_gemm_kernel():
-    """编译动态shape GEMM 内核"""
+    """Compile dynamic shape GEMM kernel"""
     print("=" * 60)
-    print("编译动态shape GEMM 内核")
+    print("Compiling dynamic shape GEMM kernel")
     print("=" * 60)
     
     os.environ['TILELANG_ASCEND_MODE'] = 'Expert'
@@ -58,22 +58,22 @@ def compile_gemm_kernel():
 
         return main
     
-    print("正在编译...")
+    print("Compiling...")
     kernel = matmul()
     
-    print(f"Kernel 编译完成")
+    print(f"Kernel compilation completed")
     print(f"  - symbolic: {kernel.symbolic}")
     print(f"  - param_info: {kernel.param_info}")
     print(f"  - out_idx: {kernel.out_idx}")
     
-    print("\n测试运行...")
+    print("\nRunning tests...")
     test_cases = [
         (1024, 512, 2048),
         (512, 1024, 512),
     ]
     
     for M, N, K in test_cases:
-        print(f"  测试 shape: M={M}, N={N}, K={K}")
+        print(f"  Testing shape: M={M}, N={N}, K={K}")
         a = torch.randn(M, K, dtype=torch.float16, device="npu")
         b = torch.randn(K, N, dtype=torch.float16, device="npu")
         c = torch.randn(M, N, dtype=torch.float16, device="npu")
@@ -82,7 +82,7 @@ def compile_gemm_kernel():
         
         ref = a @ b
         torch.testing.assert_close(c, ref, rtol=1e-2, atol=1e-2)
-        print(f"    ✓ 验证通过")
+        print(f"    ✓ Verification passed")
     
-    print("✓ 动态 GEMM 内核测试通过")
+    print("✓ Dynamic GEMM kernel tests passed")
     return kernel

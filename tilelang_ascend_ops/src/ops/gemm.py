@@ -1,7 +1,7 @@
 """
-动态shape GEMM 算子定义
+Dynamic Shape GEMM Operator Definition
 
-支持任意 M, N, K 维度的矩阵乘法
+Supports arbitrary M, N, K dimensions for matrix multiplication
 """
 
 from typing import Optional
@@ -10,7 +10,7 @@ from .base import BaseOp
 
 
 class GemmOp(BaseOp):
-    """动态shape GEMM 算子"""
+    """Dynamic shape GEMM operator"""
     
     _kernel = None
     
@@ -39,15 +39,15 @@ class GemmOp(BaseOp):
         C: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        动态shape GEMM 算子 (C = A @ B)
+        Dynamic shape GEMM operator (C = A @ B)
         
         Args:
-            A: 输入矩阵 [M, K], NPU tensor, float16
-            B: 输入矩阵 [K, N], NPU tensor, float16
-            C: 输出矩阵 [M, N], NPU tensor, float16 (可选，不传则自动分配)
+            A: Input matrix [M, K], NPU tensor, float16
+            B: Input matrix [K, N], NPU tensor, float16
+            C: Output matrix [M, N], NPU tensor, float16 (optional, auto-allocated if not provided)
         
         Returns:
-            输出矩阵 [M, N], float16
+            Output matrix [M, N], float16
         """
         if A.device.type != "npu":
             raise ValueError("A must be an NPU tensor")
