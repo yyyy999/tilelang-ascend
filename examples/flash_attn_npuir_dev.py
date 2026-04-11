@@ -7,18 +7,23 @@ import tilelang.language as T
 
 seq_len = 512
 dim = 128
+batch = 2
+heads_q = 8
+heads_kv = 2  # GQA: each KV head is shared by 4 Q heads
 
 torch.npu.set_device(0)
 
 @tilelang.jit(out_idx=[-1], target="npuir")
 def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dtype="float32"):
-    shape_q = [seq_len, dim]
-    shape_k = [seq_len, dim]
-    shape_v = [seq_len, dim]
-    shape_o = [seq_len, dim]
-    shape_work = [seq_len, seq_len]
+    shape_q = [batch, seq_len, heads_q, dim]
+    shape_k = [batch, seq_len, heads_kv, dim]
+    shape_v = [batch, seq_len, heads_kv, dim]
+    shape_o = [batch, seq_len, heads_q, dim]
     block_m = block_M
     block_n = block_N
+    num_seq_blocks = T.ceildiv(seq_len, block_m)
+    kv_group_size = heads_q // heads_kv
+
     @T.prim_func
     def flash_attention(
         Q: T.Tensor(shape_q, dtype),
@@ -26,10 +31,14 @@ def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dty
         V: T.Tensor(shape_v, dtype),
         Output: T.Tensor(shape_o, dtype),
     ):
-        with T.Kernel(T.ceildiv(seq_len, block_m), is_npu=True) as (cid, _):
-            offset = cid * block_m
+        with T.Kernel(batch * heads_q * num_seq_blocks, is_npu=True) as (cid, _):
+            seq_block_idx = cid % num_seq_blocks
+            q_head_idx = (cid // num_seq_blocks) % heads_q
+            batch_idx = cid // (heads_q * num_seq_blocks)
+            kv_head_idx = q_head_idx // kv_group_size
+            offset = seq_block_idx * block_m
             Q_shared = T.alloc_shared([block_m, dim], dtype)
-            T.copy(Q[offset : offset + block_m, 0 : dim], Q_shared)
+            T.copy(Q[batch_idx, offset : offset + block_m, q_head_idx, 0 : dim], Q_shared)
 
             K_shared = T.alloc_shared([block_n, dim], dtype)
             V_shared = T.alloc_shared([block_n, dim], dtype)
@@ -57,7 +66,7 @@ def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dty
             for k in T.Pipelined(T.ceildiv(seq_len, block_n), num_stages=2):
 
                 # cube
-                T.copy(K[k * block_n : (k + 1) * block_n, 0 : dim], K_shared)
+                T.copy(K[batch_idx, k * block_n : (k + 1) * block_n, kv_head_idx, 0 : dim], K_shared)
                 T.gemm(Q_shared, K_shared, scores, initC=True, b_transpose=True)
 
                 # vec
@@ -79,14 +88,14 @@ def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dty
                 T.vadd(tmp1, new_max, acc_m)
 
                 # cube
-                T.copy(V[k * block_n : (k + 1) * block_n, 0 : dim], V_shared)
+                T.copy(V[batch_idx, k * block_n : (k + 1) * block_n, kv_head_idx, 0 : dim], V_shared)
                 T.gemm(scores_cast, V_shared, acc_o, initC=False)
 
             T.vdiv(acc_o, acc_l, acc_o)
             O_cast = T.alloc_shared([block_m, dim], dtype)
             T.vcast(acc_o, O_cast, round_mode="rint")
-            real_m = T.min(block_m, seq_len - cid * block_m)
-            T.copy(O_cast, Output[cid * block_m : cid * block_m + real_m, 0 : dim])
+            real_m = T.min(block_m, seq_len - seq_block_idx * block_m)
+            T.copy(O_cast, Output[batch_idx, seq_block_idx * block_m : seq_block_idx * block_m + real_m, q_head_idx, 0 : dim])
 
     return flash_attention
 
@@ -96,15 +105,26 @@ def main():
     os.environ['TILELANG_ASCEND_MODE'] = 'Developer'
     kernel = online_flash_attention(64, 64, 32)
 
-    q = torch.randn((seq_len, dim), dtype=torch.float16).npu()
-    k = torch.randn((seq_len, dim), dtype=torch.float16).npu()
-    v = torch.randn((seq_len, dim), dtype=torch.float16).npu()
+    q = torch.randn((batch, seq_len, heads_q, dim), dtype=torch.float16).npu()
+    k = torch.randn((batch, seq_len, heads_kv, dim), dtype=torch.float16).npu()
+    v = torch.randn((batch, seq_len, heads_kv, dim), dtype=torch.float16).npu()
 
     output = kernel(q, k, v)
 
     scale = (1.0 / dim)**0.5
+    # BSHD -> BHSD for reference computation
+    q_bh = q.transpose(1, 2)  # [batch, heads_q, seq_len, dim]
+    k_bh = k.transpose(1, 2)  # [batch, heads_kv, seq_len, dim]
+    v_bh = v.transpose(1, 2)  # [batch, heads_kv, seq_len, dim]
+    
+    # GQA: repeat KV heads to match Q heads
+    kv_group_size = heads_q // heads_kv
+    k_bh = k_bh.repeat_interleave(kv_group_size, dim=1)  # [batch, heads_q, seq_len, dim]
+    v_bh = v_bh.repeat_interleave(kv_group_size, dim=1)  # [batch, heads_q, seq_len, dim]
+    
     ref_output = torch.nn.functional.softmax(
-        (q @ k.T).to(torch.float32) * scale, dim=-1).to(torch.float16) @ v
+        (q_bh @ k_bh.transpose(-2, -1)).to(torch.float32) * scale, dim=-1).to(torch.float16) @ v_bh
+    ref_output = ref_output.transpose(1, 2)  # [batch, seq_len, heads_q, dim]
     print("output:")
     print(output)
     print("ref_output:")
