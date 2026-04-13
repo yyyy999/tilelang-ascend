@@ -15,10 +15,10 @@ torch.npu.set_device(0)
 
 @tilelang.jit(out_idx=[-1], target="npuir")
 def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dtype="float32"):
-    shape_q = [batch, seq_len, heads_q, dim]
-    shape_k = [batch, seq_len, heads_kv, dim]
-    shape_v = [batch, seq_len, heads_kv, dim]
-    shape_o = [batch, seq_len, heads_q, dim]
+    shape_q = [batch * seq_len, heads_q * dim]
+    shape_k = [batch * seq_len, heads_kv * dim]
+    shape_v = [batch * seq_len, heads_kv * dim]
+    shape_o = [batch * seq_len, heads_q * dim]
     block_m = block_M
     block_n = block_N
     num_seq_blocks = T.ceildiv(seq_len, block_m)
@@ -37,8 +37,11 @@ def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dty
             batch_idx = cid // (heads_q * num_seq_blocks)
             kv_head_idx = q_head_idx // kv_group_size
             offset = seq_block_idx * block_m
+            row_offset = batch_idx * seq_len + offset
+            q_col_offset = q_head_idx * dim
+            kv_col_offset = kv_head_idx * dim
             Q_shared = T.alloc_shared([block_m, dim], dtype)
-            T.copy(Q[batch_idx, offset : offset + block_m, q_head_idx, 0 : dim], Q_shared)
+            T.copy(Q[row_offset : row_offset + block_m, q_col_offset : q_col_offset + dim], Q_shared)
 
             K_shared = T.alloc_shared([block_n, dim], dtype)
             V_shared = T.alloc_shared([block_n, dim], dtype)
@@ -66,7 +69,8 @@ def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dty
             for k in T.Pipelined(T.ceildiv(seq_len, block_n), num_stages=2):
 
                 # cube
-                T.copy(K[batch_idx, k * block_n : (k + 1) * block_n, kv_head_idx, 0 : dim], K_shared)
+                k_row_offset = batch_idx * seq_len + k * block_n
+                T.copy(K[k_row_offset : k_row_offset + block_n, kv_col_offset : kv_col_offset + dim], K_shared)
                 T.gemm(Q_shared, K_shared, scores, initC=True, b_transpose=True)
 
                 # vec
@@ -88,14 +92,15 @@ def online_flash_attention(block_M, block_N, block_K, dtype="float16", accum_dty
                 T.vadd(tmp1, new_max, acc_m)
 
                 # cube
-                T.copy(V[batch_idx, k * block_n : (k + 1) * block_n, kv_head_idx, 0 : dim], V_shared)
+                T.copy(V[k_row_offset : k_row_offset + block_n, kv_col_offset : kv_col_offset + dim], V_shared)
                 T.gemm(scores_cast, V_shared, acc_o, initC=False)
 
             T.vdiv(acc_o, acc_l, acc_o)
             O_cast = T.alloc_shared([block_m, dim], dtype)
             T.vcast(acc_o, O_cast, round_mode="rint")
             real_m = T.min(block_m, seq_len - seq_block_idx * block_m)
-            T.copy(O_cast, Output[batch_idx, seq_block_idx * block_m : seq_block_idx * block_m + real_m, q_head_idx, 0 : dim])
+            out_row_offset = batch_idx * seq_len + seq_block_idx * block_m
+            T.copy(O_cast, Output[out_row_offset : out_row_offset + real_m, q_col_offset : q_col_offset + dim])
 
     return flash_attention
 
@@ -109,7 +114,13 @@ def main():
     k = torch.randn((batch, seq_len, heads_kv, dim), dtype=torch.float16).npu()
     v = torch.randn((batch, seq_len, heads_kv, dim), dtype=torch.float16).npu()
 
-    output = kernel(q, k, v)
+    # Flatten to 2D: [B*S, H*D]
+    q_flat = q.reshape(batch * seq_len, heads_q * dim)
+    k_flat = k.reshape(batch * seq_len, heads_kv * dim)
+    v_flat = v.reshape(batch * seq_len, heads_kv * dim)
+
+    output_flat = kernel(q_flat, k_flat, v_flat)
+    output = output_flat.reshape(batch, seq_len, heads_q, dim)
 
     scale = (1.0 / dim)**0.5
     # BSHD -> BHSD for reference computation
