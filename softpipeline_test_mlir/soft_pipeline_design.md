@@ -17,7 +17,88 @@ Vector:       [Soft_0][Soft_1][Soft_2][Soft_3]  [Acc_0][Acc_1][Acc_2][Acc_3]
                ↑ V:Soft_0 与 C:QK_1 叠加！
 ```
 
----
+### 1.2 num\_stages 对性能的影响
+
+`num_stages` 决定了流水线阶段数和多缓冲区数量，直接影响软流水的有效性。
+
+#### num\_stages=2 的情况
+
+**缓冲区分配**：
+
+```
+num_stages = 2, 4 个 ScopeOp (QK, SOFT, PV, ACC)
+
+Buffer[0]: QK 和 PV 共享
+Buffer[1]: SOFT 和 ACC 共享
+```
+
+**执行时间线**：
+
+```
+时间步:  0     1      2      3      4      5
+CUBE:  QK[0] QK[1]  (等待)  PV[0]  PV[1]
+VECTOR:       SOFT[0] SOFT[1] (等待) ACC[0] ACC[1]
+```
+
+**问题分析**：
+
+- PV\[0] 必须等待 SOFT\[0] 完成，因为它们共享 Buffer\[0]
+- QK\[0] 写入 Buffer\[0] → SOFT\[0] 读取 Buffer\[0]，写入 Buffer\[1] → PV\[0] 需要写入 Buffer\[0]
+- 由于缓冲区冲突，PV\[0] 必须等 SOFT\[0] 读完后才能覆盖 Buffer\[0]
+
+**与 Unroll 对比**：
+
+| 模式                            | 时间线               | CV 叠加 |
+| ----------------------------- | ----------------- | ----- |
+| Unroll (num\_stages=2)        | QK→SOFT→PV→ACC 串行 | ❌ 无   |
+| Soft Pipeline (num\_stages=2) | 同上，需要等待缓冲区        | ❌ 无   |
+
+**结论**：`num_stages=2` 时，软流水和 Unroll 效果类似，因为缓冲区不足导致必须串行等待。
+
+#### num\_stages=4 的情况
+
+**缓冲区分配**：
+
+```
+num_stages = 4, 4 个 ScopeOp (QK, SOFT, PV, ACC)
+
+Buffer[0]: QK 专用
+Buffer[1]: SOFT 专用
+Buffer[2]: PV 专用
+Buffer[3]: ACC 专用
+```
+
+**执行时间线**：
+
+```
+时间步:  0     1      2      3      4
+CUBE:  QK[0] QK[1]  PV[0]  PV[1]
+VECTOR:       SOFT[0] SOFT[1] ACC[0] ACC[1]
+               ↑ CV 叠加！
+```
+
+**优势分析**：
+
+- QK\[1] 和 SOFT\[0] 使用不同的缓冲区，可以并行执行
+- PV\[0] 和 SOFT\[1] 使用不同的缓冲区，可以并行执行
+- 实现了真正的 CV 核叠加执行
+
+**结论**：`num_stages=4` 时，每个 stage 有独立缓冲区，软流水发挥 CV 叠加效果。
+
+#### 总结
+
+| num\_stages | 缓冲区数量 | 缓冲区分配                  | CV 叠加效果                                  |
+| ----------- | ----- | ---------------------- | ---------------------------------------- |
+| 2           | 2     | QK/PV 共享, SOFT/ACC 共享  | ❌ 无（和 Unroll 一样串行）                       |
+| 4           | 4     | QK, SOFT, PV, ACC 各自独立 | ✅ 有（QK\[1]∥SOFT\[0], PV\[0]∥SOFT\[1]...） |
+
+**关键结论**：
+
+- 软流水要有效，需要 `num_stages >= ScopeOps 数量`
+- 当 `num_stages < ScopeOps 数量` 时，缓冲区冲突会强制串行等待，软流水退化为 Unroll
+- 对于 FA 算子（4 个 ScopeOp），`num_stages` 应该设置为 4 或更大
+
+***
 
 ## 2. 核心设计
 
@@ -79,26 +160,26 @@ scf.for %arg14 = %c0 to %c8 step %c1 { tilelangir.num_stages = 4 }
 
 ### 2.2 关键设计决策
 
-| 决策 | 选择 | 原因 |
-|------|------|------|
-| 循环结构 | 1 个内层循环 + `scf.if` 分发 | 硬件层面 Cube/Vector 是同一核的不同单元，共享同一控制流 |
-| 同步方式 | 内嵌在 `scf.if` 分支内 | 同步标志与阶段绑定，不同阶段有不同的 wait/set 对 |
-| 标志计算 | `flag_id = outerIV * num_stages + innerIV` | 确保每次迭代有唯一标志，避免冲突 |
-| 标志取模 | `% 16` (SYNC_FLAGS_LIMIT) | 硬件同步标志数量有限，需要循环复用 |
-| 新 Pass 文件 | `EnableSoftPipeline.cpp` | 独立于原有 `EnableMultiBuffer.cpp`，不影响 unroll 模式 |
+| 决策        | 选择                                         | 原因                                          |
+| --------- | ------------------------------------------ | ------------------------------------------- |
+| 循环结构      | 1 个内层循环 + `scf.if` 分发                      | 硬件层面 Cube/Vector 是同一核的不同单元，共享同一控制流          |
+| 同步方式      | 内嵌在 `scf.if` 分支内                           | 同步标志与阶段绑定，不同阶段有不同的 wait/set 对               |
+| 标志计算      | `flag_id = outerIV * num_stages + innerIV` | 确保每次迭代有唯一标志，避免冲突                            |
+| 标志取模      | `% 16` (SYNC\_FLAGS\_LIMIT)                | 硬件同步标志数量有限，需要循环复用                           |
+| 新 Pass 文件 | `EnableSoftPipeline.cpp`                   | 独立于原有 `EnableMultiBuffer.cpp`，不影响 unroll 模式 |
 
----
+***
 
 ## 3. 新增 Pass: `enable_soft_pipeline`
 
 ### 3.1 文件清单
 
-| 文件 | 作用 |
-|------|------|
-| `tilelangir/lib/Transforms/EnableSoftPipeline.cpp` | Pass 实现 |
-| `tilelangir/include/tilelangir/Transforms/Passes.td` | 添加 TableGen 定义 |
-| `tilelangir/lib/Transforms/CMakeLists.txt` | 添加编译源文件 |
-| `tilelang/engine/lower.py` | 注册 Pass 到 pipeline |
+| 文件                                                   | 作用                 |
+| ---------------------------------------------------- | ------------------ |
+| `tilelangir/lib/Transforms/EnableSoftPipeline.cpp`   | Pass 实现            |
+| `tilelangir/include/tilelangir/Transforms/Passes.td` | 添加 TableGen 定义     |
+| `tilelangir/lib/Transforms/CMakeLists.txt`           | 添加编译源文件            |
+| `tilelang/engine/lower.py`                           | 注册 Pass 到 pipeline |
 
 ### 3.2 Pass 定义 (Passes.td)
 
@@ -196,7 +277,191 @@ flag_id = outerIV * num_stages + innerIV
   i=1, j=0 (CUBE:QK_4)   wait VECTOR(4) ← 与 i=0,j=3 的 VECTOR 操作叠加！
 ```
 
-### 3.5 Init/Clear 同步
+### 3.5 Prologue/Epilogue 设计
+
+#### 问题分析
+
+传统软件流水线需要三个阶段：
+
+```
+Prologue（预填充）:
+  执行前 (stages-1) 个 stage，填充流水线
+  
+Steady State（稳态）:
+  所有 stage 并行执行
+  
+Epilogue（排空）:
+  执行剩余 stage，排空流水线
+```
+
+当前实现缺少 Prologue/Epilogue，会导致：
+
+**第一个外层迭代问题**：
+
+```
+outer=0:
+  inner=0 (Stage 0): 执行 ✅
+  inner=1 (Stage 1): wait Stage 0 → 阻塞！（Stage 0 的 sync_set 还没被其他核看到）
+  inner=2,3: 同样阻塞
+```
+
+**最后一个外层迭代问题**：
+
+```
+outer=N-1:
+  inner=0,1,2: 正常执行
+  inner=3 (Stage 3): 执行后没有后续迭代来消费其结果
+```
+
+#### 解决方案
+
+**方案 A：Init 循环预填充（推荐）**
+
+在主循环前插入 init 循环，预先设置同步标志：
+
+```mlir
+// Init: 预填充同步标志，让第一个 CUBE stage 不被阻塞
+scf.for %j = 0 to %num_stages {
+  sync_block_set[VECTOR](%j)  // 初始化 Vector 标志
+}
+
+// 主循环
+scf.for %outer = 0 to %N_div_stages {
+  scf.for %inner = 0 to %num_stages {
+    %flag_id = %outer * %num_stages + %inner
+    scf.if (%inner == 0) {
+      sync_block_wait[VECTOR](%flag_id)  // 第一个迭代：wait flag=0，已被 init 设置
+      // Stage 0 ops...
+      sync_block_set[CUBE](%flag_id)
+    }
+    scf.if (%inner == 1) {
+      sync_block_wait[CUBE](%flag_id)     // wait Stage 0
+      // Stage 1 ops...
+      sync_block_set[VECTOR](%flag_id + %num_stages)
+    }
+    // ...
+  }
+}
+
+// Clear: 等待最后的 CUBE 完成
+scf.for %j = 0 to %num_stages {
+  %final_flag = %N_div_stages * %num_stages + %j
+  sync_block_wait[CUBE](%final_flag)
+}
+```
+
+**方案 B：分离 Prologue/Epilogue 循环**
+
+显式生成 prologue 和 epilogue 循环：
+
+```mlir
+// Prologue: 执行前 (stages-1) 次迭代
+scf.for %p = 0 to %num_stages_minus_1 {
+  // 只执行 stage 0..p 的操作
+  scf.if (%p >= 0) { /* Stage 0 */ }
+  scf.if (%p >= 1) { /* Stage 1 */ }
+  // ...
+}
+
+// Steady State: 主循环
+scf.for %outer = 0 to %N_div_stages {
+  scf.for %inner = 0 to %num_stages {
+    // 所有 stage 正常执行
+  }
+}
+
+// Epilogue: 排空最后 (stages-1) 次迭代
+scf.for %e = 0 to %num_stages_minus_1 {
+  // 只执行 stage (num_stages-1-e)..(num_stages-1) 的操作
+  scf.if (%e <= 0) { /* Stage 3 */ }
+  scf.if (%e <= 1) { /* Stage 2 */ }
+  // ...
+}
+```
+
+#### 选择方案 A 的原因
+
+1. **实现简单**：只需在主循环前后各加一个简单循环
+2. **IR 紧凑**：不需要复杂的 prologue/epilogue 条件判断
+3. **同步语义清晰**：init 设置初始标志，clear 等待最终标志
+4. **与现有 init/clear 设计一致**：原设计已有 init/clear 概念，只需完善
+
+#### Init/Clear 实现细节
+
+```cpp
+void insertInitAndClear(scf::ForOp outerFor, int32_t numStages,
+                        hivm::TCoreType beginCoreType,
+                        hivm::TCoreType endCoreType) {
+  OpBuilder builder(outerFor);
+  Location loc = outerFor.getLoc();
+  
+  // Init: 在主循环前，设置初始同步标志
+  // 如果第一个 stage 是 CUBE，需要初始化 VECTOR 标志
+  // 如果第一个 stage 是 VECTOR，需要初始化 CUBE 标志
+  hivm::TCoreType initCoreType = anotherCoreType(beginCoreType);
+  
+  builder.setInsertionPoint(outerFor);
+  auto initFor = builder.create<scf::ForOp>(loc, c0, cNumStages, c1);
+  initFor->setAttr("hivm.tcore_type", 
+                   TCoreTypeAttr::get(builder.getContext(), initCoreType));
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(initFor.getBody());
+    Value initId = convertToI64(builder, loc, initFor.getInductionVar());
+    buildCVSyncSet(builder, loc, initCoreType, initId);
+  }
+  
+  // Clear: 在主循环后，等待最终同步标志
+  // 如果最后一个 stage 是 CUBE，需要等待 CUBE 标志
+  // 如果最后一个 stage 是 VECTOR，需要等待 VECTOR 标志
+  hivm::TCoreType clearCoreType = anotherCoreType(endCoreType);
+  
+  builder.setInsertionPointAfter(outerFor);
+  auto clearFor = builder.create<scf::ForOp>(loc, c0, cNumStages, c1);
+  clearFor->setAttr("hivm.tcore_type",
+                    TCoreTypeAttr::get(builder.getContext(), clearCoreType));
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(clearFor.getBody());
+    // clear flag id = (upperBound - 1) * numStages + j
+    // 但由于外层循环 upperBound 已被修改为 N/numStages
+    // 实际需要等待的是最后一次迭代的 flag
+    Value clearId = convertToI64(builder, loc, clearFor.getInductionVar());
+    buildCVSyncWait(builder, loc, clearCoreType, clearId);
+  }
+}
+```
+
+#### FA 算子 CVCV 示例
+
+```
+num_stages = 4, ScopeOps = [CUBE, VECTOR, CUBE, VECTOR]
+
+Init (VECTOR 核):
+  for j=0..4:
+    sync_block_set[VECTOR](j)  // 设置 flag 0,1,2,3
+
+主循环 outer=0:
+  inner=0 (CUBE):  wait VECTOR(0) ✅ 已被 init 设置
+                   set CUBE(0)
+  inner=1 (VECTOR): wait CUBE(0) ✅ 刚被 inner=0 设置
+                    set VECTOR(4)  // flag = 0*4+1+4 = 5, mod 16 = 5
+  inner=2 (CUBE):  wait VECTOR(5) ✅ 等待上一个外层迭代的 VECTOR
+                   set CUBE(5)
+  inner=3 (VECTOR): wait CUBE(5) ✅
+                    set VECTOR(7)
+
+主循环 outer=1:
+  inner=0 (CUBE):  wait VECTOR(4) ✅ 等待 outer=0, inner=3 的 VECTOR
+                   set CUBE(4)
+  // ... CV 叠加发生！
+
+Clear (CUBE 核):
+  for j=0..4:
+    sync_block_wait[CUBE](final_flag)  // 等待最后的 CUBE 完成
+```
+
+### 3.6 Init/Clear 同步（旧版，保留参考）
 
 ```
 init: for j=0..num_stages {
@@ -208,7 +473,7 @@ clear: for j=0..num_stages {
 }
 ```
 
----
+***
 
 ## 4. 受影响 Pass 的修改方案
 
@@ -217,6 +482,7 @@ clear: for j=0..num_stages {
 **问题**: 当前逻辑为每个内层循环插入同步，但 soft pipeline 的同步已内嵌在 `scf.if` 分支中。
 
 **修改方案**:
+
 - 检测内层循环是否有 `hivm.soft_pipeline` 属性
 - 如果有，跳过该循环的同步插入（同步已在 `enable_soft_pipeline` 中完成）
 - 仍然处理 init/clear 循环（或由 `enable_soft_pipeline` 自行生成）
@@ -240,6 +506,7 @@ void InsertCVSyncInSinglePipeline(scf::ForOp outerFor) {
 **问题**: `findStageLoop` 查找 `upperBound == multiBuffer` 的内层循环，但 soft pipeline 的内层循环结构不同。
 
 **修改方案**:
+
 - 在 `findStageLoop` 中增加对 `hivm.soft_pipeline` 循环的识别
 - Soft pipeline 循环的 `upperBound == num_stages`，父循环有 `tilelangir.num_stages`
 - subview 的 stage index 使用内层循环变量
@@ -282,6 +549,7 @@ static scf::ForOp findStageLoop(Operation *op, int32_t multiBuffer) {
 **问题**: 当前按 `hivm.tcore_type` 属性决定循环保留/删除。Soft pipeline 的内层循环没有单一 `tcore_type`，包含混合的 `scf.if` 分支。
 
 **修改方案**:
+
 - 检测 `hivm.soft_pipeline` 循环
 - AIC 函数：保留 `scf.if` 中 Cube 分支的操作，删除 Vector 分支
 - AIV 函数：保留 `scf.if` 中 Vector 分支的操作，删除 Cube 分支
@@ -341,21 +609,21 @@ static void filterSoftPipelineLoop(scf::ForOp forOp, bool isAIC) {
 
 ### 4.4 不需要修改的 Pass
 
-| Pass | 原因 |
-|------|------|
-| `insert_workspace` | 在 cv_split 之前，不关心循环结构 |
-| `mark_multibuffer` | 在 cv_split 之前，不关心循环结构 |
-| `cv_split` | 生成 ScopeOp，soft pipeline 在其后处理 |
-| `infer_mem_scope` | 按 memref 类型和操作类型传播，不关心循环结构 |
-| `merge_copy_chains` | 按 copy 操作类型匹配，不关心循环结构 |
-| `specialize_cube` | 按 address_space 替换 copy，不关心循环结构 |
-| `bind_workspace_arg` | 绑定 workspace 参数，不关心循环结构 |
-| `plan_workspace_memory` | 分配 workspace offset，不关心循环结构 |
-| `infer_workspace_size_func` | 在 insert_cv_sync 之后 |
-| `lower_memref_ext` | 在 insert_cv_sync 之后 |
-| `wrap_host_function` | 在 split_mix_kernel 之后 |
+| Pass                        | 原因                               |
+| --------------------------- | -------------------------------- |
+| `insert_workspace`          | 在 cv\_split 之前，不关心循环结构           |
+| `mark_multibuffer`          | 在 cv\_split 之前，不关心循环结构           |
+| `cv_split`                  | 生成 ScopeOp，soft pipeline 在其后处理   |
+| `infer_mem_scope`           | 按 memref 类型和操作类型传播，不关心循环结构       |
+| `merge_copy_chains`         | 按 copy 操作类型匹配，不关心循环结构            |
+| `specialize_cube`           | 按 address\_space 替换 copy，不关心循环结构 |
+| `bind_workspace_arg`        | 绑定 workspace 参数，不关心循环结构          |
+| `plan_workspace_memory`     | 分配 workspace offset，不关心循环结构      |
+| `infer_workspace_size_func` | 在 insert\_cv\_sync 之后            |
+| `lower_memref_ext`          | 在 insert\_cv\_sync 之后            |
+| `wrap_host_function`        | 在 split\_mix\_kernel 之后          |
 
----
+***
 
 ## 5. Pipeline 执行顺序
 
@@ -389,10 +657,11 @@ pipeline.add(transforms.tilelangir.wrap_host_function)
 ### 5.2 模式选择
 
 通过参数控制使用 unroll 还是 soft pipeline：
+
 - Python 层: `T.Pipelined(num_stages=2, soft_pipeline=True)`
 - C++ 层: Pass 构造参数 `soft_pipeline`
 
----
+***
 
 ## 6. 实现步骤
 
@@ -433,14 +702,15 @@ pipeline.add(transforms.tilelangir.wrap_host_function)
 - 运行 FA 算子性能测试
 - 验证 CV 叠加效果
 
----
+***
 
 ## 7. 风险与注意事项
 
-| 风险 | 影响 | 缓解措施 |
-|------|------|---------|
-| `scf.if` 分支内操作过多 | 代码膨胀 | 仅在 soft pipeline 模式下使用 |
-| 同步标志冲突 | 死锁 | 仔细验证 flag_id 计算和取模逻辑 |
+| 风险                        | 影响          | 缓解措施                                     |
+| ------------------------- | ----------- | ---------------------------------------- |
+| `scf.if` 分支内操作过多          | 代码膨胀        | 仅在 soft pipeline 模式下使用                   |
+| 同步标志冲突                    | 死锁          | 仔细验证 flag\_id 计算和取模逻辑                    |
 | `enable_local_buffer` 兼容性 | buffer 访问错误 | 测试 `findStageLoop` 对 soft pipeline 循环的识别 |
-| `split_mix_kernel` 拆分正确性 | 运行时错误 | 增加 soft pipeline 循环的专门处理逻辑 |
-| `scf.if` 条件判断开销 | 性能损失 | 硬件层面条件判断开销极小，可忽略 |
+| `split_mix_kernel` 拆分正确性  | 运行时错误       | 增加 soft pipeline 循环的专门处理逻辑               |
+| `scf.if` 条件判断开销           | 性能损失        | 硬件层面条件判断开销极小，可忽略                         |
+

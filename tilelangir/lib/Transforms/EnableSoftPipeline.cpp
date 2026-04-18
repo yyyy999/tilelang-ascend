@@ -51,8 +51,13 @@ namespace tilelangir {
 #define GEN_PASS_DEF_TILELANGIRENABLESOFTPIPELINE
 #include "tilelangir/Transforms/Passes.h.inc"
 
+// 同步标志数量上限，用于CV同步机制
+// 限制同步flag的数量，避免资源耗尽
 static constexpr size_t SYNC_FLAGS_LIMIT = 16;
 
+/// 扩展MemRef类型，添加多缓冲维度
+/// 在原有shape前面添加一个维度用于多缓冲
+/// 例如: [M, N] -> [multiBuffer, M, N]
 static MemRefType expandMemRefType(MemRefType oldType, int32_t multiBuffer) {
   ArrayRef<int64_t> oldShape = oldType.getShape();
   SmallVector<int64_t> newShape;
@@ -85,6 +90,7 @@ static MemRefType expandMemRefType(MemRefType oldType, int32_t multiBuffer) {
                          oldType.getMemorySpace());
 }
 
+/// 将值转换为i64类型，用于同步标志计算
 static Value convertToI64(OpBuilder &builder, Location loc, Value val) {
   auto type = val.getType();
   if (type.isInteger(64))
@@ -96,11 +102,14 @@ static Value convertToI64(OpBuilder &builder, Location loc, Value val) {
   llvm_unreachable("Unsupported type for conversion to i64");
 }
 
+/// 获取另一种核心类型（CUBE <-> VECTOR）
 static hivm::TCoreType anotherCoreType(const hivm::TCoreType &current) {
   return current == hivm::TCoreType::VECTOR ? hivm::TCoreType::CUBE
                                             : hivm::TCoreType::VECTOR;
 }
 
+/// 构建CV同步设置操作 (sync_block_set)
+/// 用于通知另一种核心类型当前操作已完成
 static void buildCVSyncSet(OpBuilder &builder, Location loc,
                            hivm::TCoreType coreSrc, Value flagId) {
   auto coreSrcAttr =
@@ -120,6 +129,8 @@ static void buildCVSyncSet(OpBuilder &builder, Location loc,
                                        sync_mode);
 }
 
+/// 构建CV同步等待操作 (sync_block_wait)
+/// 用于等待另一种核心类型的操作完成
 static void buildCVSyncWait(OpBuilder &builder, Location loc,
                             hivm::TCoreType coreSrc, Value flagId) {
   auto coreSrcAttr =
@@ -133,6 +144,9 @@ static void buildCVSyncWait(OpBuilder &builder, Location loc,
                                         pipTypeAttr, flagId);
 }
 
+/// Workspace扩展器
+/// 负责将workspace buffer扩展为多缓冲结构
+/// 例如: 将 [M, N] 扩展为 [num_stages, M, N]
 class WorkspaceExpander {
 public:
   static bool expand(Operation *op) {
@@ -190,6 +204,8 @@ public:
   }
 };
 
+/// Soft Pipeline转换器
+/// 将多个ScopeOp转换为单个内层循环 + scf.if分支调度的结构
 class SoftPipelineConverter {
 public:
   SoftPipelineConverter(scf::ForOp outerFor,
@@ -198,6 +214,8 @@ public:
       : outerFor_(outerFor), scopeOps_(scopeOps),
         workspaceValues_(workspaceValues), numStages_(numStages) {}
 
+  /// 核心转换方法
+  /// 将外层循环内的多个ScopeOp转换为软流水结构
   bool convert() {
     if (scopeOps_.empty())
       return false;
@@ -206,6 +224,7 @@ public:
     Location loc = outerFor_.getLoc();
     Value outerIV = outerFor_.getInductionVar();
 
+    // 创建常量: 0, num_stages, 1
     Value c0 = builder.create<arith::ConstantOp>(loc, builder.getI32Type(),
                                                  builder.getI32IntegerAttr(0));
     Value cNumStages = builder.create<arith::ConstantOp>(
@@ -213,6 +232,7 @@ public:
     Value c1 = builder.create<arith::ConstantOp>(loc, builder.getI32Type(),
                                                  builder.getI32IntegerAttr(1));
 
+    // 创建内层循环: for innerIV = 0 to num_stages step 1
     auto innerFor = builder.create<scf::ForOp>(loc, c0, cNumStages, c1,
                                                ValueRange{});
     innerFor->setAttr("hivm.soft_pipeline", builder.getUnitAttr());
@@ -225,6 +245,7 @@ public:
 
     builder.setInsertionPoint(innerBody, innerBody->begin());
 
+    // 计算同步标志ID: flag_id = outerIV * num_stages + innerIV
     Value outerIVi64 = convertToI64(builder, loc, outerIV);
     Value innerIVi64 = convertToI64(builder, loc, innerIV);
     Value numStagesI64 = builder.create<arith::ConstantOp>(
@@ -234,8 +255,10 @@ public:
 
     Value flagBase = builder.create<arith::MulIOp>(loc, outerIVi64, numStagesI64);
     Value flagIdI64 = builder.create<arith::AddIOp>(loc, flagBase, innerIVi64);
+    // 计算下一个外层迭代的flag_id: flag_id_next = flag_id + num_stages
     Value flagIdNextI64 =
         builder.create<arith::AddIOp>(loc, flagIdI64, numStagesI64);
+    // 对flag_id取模，限制在SYNC_FLAGS_LIMIT范围内
     Value flagIdMod =
         builder.create<arith::RemSIOp>(loc, flagIdI64, syncLimitI64);
     Value flagIdNextMod =
@@ -244,6 +267,8 @@ public:
     Value stageIdx =
         builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), innerIV);
 
+    // 计算新的外层索引表达式: newOuterExpr = outerIV * num_stages + innerIV
+    // 用于调整全局内存的subview偏移
     newOuterExprI32_ = builder.create<arith::AddIOp>(
         loc,
         builder.create<arith::MulIOp>(
@@ -256,6 +281,7 @@ public:
 
     innerFor_ = innerFor;
 
+    // 为每个ScopeOp创建scf.if分支
     for (size_t stageIdx_ = 0; stageIdx_ < scopeOps_.size(); ++stageIdx_) {
       auto scopeOp = scopeOps_[stageIdx_];
       auto coreTypeAttr =
@@ -268,6 +294,7 @@ public:
 
       builder.setInsertionPoint(terminator);
 
+      // 创建条件判断: if (innerIV == stageIdx_)
       Value cmpVal = builder.create<arith::CmpIOp>(
           loc, arith::CmpIPredicate::eq, innerIV,
           builder.create<arith::ConstantOp>(loc, builder.getI32Type(),
@@ -277,17 +304,21 @@ public:
       Block *thenBlock = &ifOp.getThenRegion().front();
       builder.setInsertionPointToStart(thenBlock);
 
+      // 确定同步的核心类型和flag_id
       hivm::TCoreType waitCoreType = anotherCoreType(coreType);
       Value waitFlagId = flagIdMod;
       Value setFlagId = flagIdNextMod;
 
+      // 第一个stage使用原始flag_id（不跨外层迭代）
       if (stageIdx_ == 0) {
         waitFlagId = flagIdI64;
         setFlagId = flagIdI64;
       }
 
+      // 插入同步等待操作: 等待前一个stage完成
       buildCVSyncWait(builder, loc, waitCoreType, waitFlagId);
 
+      // 将ScopeOp内的操作移动到scf.if分支中
       Region *scopeRegion = &scopeOp.getRegion();
       if (!scopeRegion->empty()) {
         Block *scopeBody = &scopeRegion->front();
@@ -302,13 +333,16 @@ public:
         }
       }
 
+      // 调整分支内的操作（workspace subview, 全局内存偏移等）
       adjustOperationsInBranch(thenBlock, newOuterExprI32_, newOuterExprIdx,
                                stageIdx_, builder);
 
       builder.setInsertionPoint(thenBlock->getTerminator());
+      // 插入同步设置操作: 通知下一个stage当前操作已完成
       buildCVSyncSet(builder, loc, coreType, setFlagId);
     }
 
+    // 删除原始的ScopeOp
     for (auto scopeOp : scopeOps_) {
       scopeOp->erase();
     }
@@ -317,6 +351,8 @@ public:
   }
 
 private:
+  /// 调整scf.if分支内的操作
+  /// 包括: workspace subview调整、全局内存偏移调整、copy操作调整
   void adjustOperationsInBranch(Block *thenBlock, Value newOuterExprI32,
                                 Value newOuterExprIdx, size_t stageIdx,
                                 OpBuilder &builder) {
@@ -354,6 +390,9 @@ private:
     }
   }
 
+  /// 调整workspace的subview操作
+  /// 添加stage维度索引，用于多缓冲访问
+  /// 例如: subview %ws[%i, ...] -> subview %ws[%stageIdx, %i, ...]
   void adjustWorkspaceSubview(memref::SubViewOp subview, OpBuilder &builder) {
     Location loc = subview.getLoc();
     Value source = subview.getSource();
@@ -420,6 +459,8 @@ private:
     subview.erase();
   }
 
+  /// 调整全局内存的subview偏移
+  /// 使用新的外层索引表达式替换原始的外层循环变量
   void adjustGlobalSubviewOffset(memref::SubViewOp subview, Value newOuterI32,
                                  OpBuilder &builder) {
     auto origOffsets = subview.getMixedOffsets();
@@ -447,6 +488,8 @@ private:
     subview.erase();
   }
 
+  /// 调整copy操作
+  /// 为workspace相关的copy操作添加stage维度索引
   void adjustCopyOp(memref::CopyOp copyOp, OpBuilder &builder) {
     Location loc = copyOp.getLoc();
     Value innerIV = innerFor_.getInductionVar();
@@ -531,12 +574,19 @@ private:
   Value newOuterExprI32_;
 };
 
+/// Soft Pipeline处理器
+/// 负责处理整个pipeline循环的转换
 class SoftPipelineProcessor {
 public:
   SoftPipelineProcessor(scf::ForOp pipelineLoop,
                         ArrayRef<Value> workspaceValues)
       : pipelineLoop_(pipelineLoop), workspaceValues_(workspaceValues) {}
 
+  /// 处理pipeline循环
+  /// 1. 收集ScopeOp列表
+  /// 2. 修改外层循环迭代次数
+  /// 3. 调用SoftPipelineConverter进行转换
+  /// 4. 插入Init/Clear同步循环
   bool process() {
     auto attr =
         pipelineLoop_->getAttrOfType<IntegerAttr>("tilelangir.num_stages");
@@ -586,36 +636,48 @@ public:
     bool changed = converter.convert();
 
     if (changed) {
-      insertInitAndClear(pipelineLoop_, numStages, beginCoreType, endCoreType);
+      insertInitAndClear(pipelineLoop_, numStages, beginCoreType, endCoreType, oldUpper);
     }
 
     return changed;
   }
 
 private:
+  /// 插入Init和Clear同步循环
+  /// 
+  /// Init循环: 在主循环前预先设置同步标志，让第一个stage不被阻塞
+  ///   for j = 0 to num_stages:
+  ///     sync_block_set[initCoreType](j)
+  ///
+  /// Clear循环: 在主循环后等待最后的操作完成
+  ///   for j = 0 to num_stages:
+  ///     sync_block_wait[clearCoreType](outerIV * num_stages + j)
   void insertInitAndClear(scf::ForOp outerFor, int32_t numStages,
                           hivm::TCoreType beginCoreType,
-                          hivm::TCoreType endCoreType) {
+                          hivm::TCoreType endCoreType,
+                          Value originalUpperBound) {
     if (beginCoreType == hivm::TCoreType::CUBE_OR_VECTOR)
       return;
 
-    hivm::TCoreType initCoreType = anotherCoreType(beginCoreType);
-    hivm::TCoreType clearCoreType = anotherCoreType(endCoreType);
-
-    Block *parentBlock = outerFor->getBlock();
     OpBuilder builder(outerFor->getContext());
+    Location loc = outerFor->getLoc();
 
+    // 创建常量
     Value c0 = builder.create<arith::ConstantOp>(
-        outerFor.getLoc(), builder.getI32Type(), builder.getI32IntegerAttr(0));
+        loc, builder.getI32Type(), builder.getI32IntegerAttr(0));
     Value cNumStages = builder.create<arith::ConstantOp>(
-        outerFor.getLoc(), builder.getI32Type(),
-        builder.getI32IntegerAttr(numStages));
+        loc, builder.getI32Type(), builder.getI32IntegerAttr(numStages));
     Value c1 = builder.create<arith::ConstantOp>(
-        outerFor.getLoc(), builder.getI32Type(), builder.getI32IntegerAttr(1));
+        loc, builder.getI32Type(), builder.getI32IntegerAttr(1));
 
+    // Init核心类型: 与第一个stage的核心类型相反
+    // 如果第一个stage是CUBE，则需要初始化VECTOR标志
+    hivm::TCoreType initCoreType = anotherCoreType(beginCoreType);
+
+    // 创建Init循环
     builder.setInsertionPoint(outerFor);
     auto initForOp =
-        builder.create<scf::ForOp>(outerFor.getLoc(), c0, cNumStages, c1);
+        builder.create<scf::ForOp>(loc, c0, cNumStages, c1);
     auto initCoreTypeAttr =
         mlir::hivm::TCoreTypeAttr::get(builder.getContext(), initCoreType);
     initForOp->setAttr(hivm::TCoreTypeAttr::name, initCoreTypeAttr);
@@ -628,9 +690,14 @@ private:
       buildCVSyncSet(builder, initForOp->getLoc(), initCoreType, initId);
     }
 
+    // Clear核心类型: 与最后一个stage的核心类型相反
+    // 如果最后一个stage是VECTOR，则需要等待CUBE标志
+    hivm::TCoreType clearCoreType = anotherCoreType(endCoreType);
+
+    // 创建Clear循环
     builder.setInsertionPointAfter(outerFor);
     auto clearForOp =
-        builder.create<scf::ForOp>(outerFor.getLoc(), c0, cNumStages, c1);
+        builder.create<scf::ForOp>(loc, c0, cNumStages, c1);
     auto clearCoreTypeAttr =
         mlir::hivm::TCoreTypeAttr::get(builder.getContext(), clearCoreType);
     clearForOp->setAttr(hivm::TCoreTypeAttr::name, clearCoreTypeAttr);
@@ -638,9 +705,27 @@ private:
       OpBuilder::InsertionGuard guard(builder);
       Block *clearBody = clearForOp.getBody();
       builder.setInsertionPointToStart(clearBody);
-      Value clearId = clearForOp.getInductionVar();
-      clearId = convertToI64(builder, clearForOp->getLoc(), clearId);
-      buildCVSyncWait(builder, clearForOp->getLoc(), clearCoreType, clearId);
+
+      // 计算clear的flag_id: outerIV * num_stages + innerIV
+      // 等待最后一次外层迭代的对应stage完成
+      Value outerIV = outerFor.getInductionVar();
+      Value innerIV = clearForOp.getInductionVar();
+
+      Value numStagesI64 = builder.create<arith::ConstantOp>(
+          loc, builder.getI64Type(), builder.getI64IntegerAttr(numStages));
+
+      Value outerIVi64 = convertToI64(builder, loc, outerIV);
+      Value innerIVi64 = convertToI64(builder, loc, innerIV);
+
+      Value flagBase = builder.create<arith::MulIOp>(loc, outerIVi64, numStagesI64);
+      Value flagIdI64 = builder.create<arith::AddIOp>(loc, flagBase, innerIVi64);
+
+      Value syncLimitI64 = builder.create<arith::ConstantOp>(
+          loc, builder.getI64Type(), builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
+      Value flagIdMod =
+          builder.create<arith::RemSIOp>(loc, flagIdI64, syncLimitI64);
+
+      buildCVSyncWait(builder, clearForOp->getLoc(), clearCoreType, flagIdMod);
     }
   }
 
@@ -648,6 +733,7 @@ private:
   SmallVector<Value> workspaceValues_;
 };
 
+/// Pass入口: TileLangIREnableSoftPipeline
 namespace {
 struct TileLangIREnableSoftPipeline
     : public impl::TileLangIREnableSoftPipelineBase<
@@ -668,12 +754,15 @@ void TileLangIREnableSoftPipeline::runOnOperation() {
 
   LLVM_DEBUG(DBGS() << "Starting EnableSoftPipeline pass\n");
 
+  // Step 1: 扩展workspace buffer，添加多缓冲维度
   if (!WorkspaceExpander::expand(module)) {
     LLVM_DEBUG(DBGS() << "No workspaces to expand.\n");
     return;
   }
 
+  // Step 2: 遍历每个函数，处理pipeline循环
   for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+    // 收集扩展后的workspace
     SmallVector<Value> expandedWorkspaces;
     func.walk([&](memref_ext::AllocWorkspaceOp allocOp) {
       auto type = allocOp.getType().cast<MemRefType>();
@@ -689,6 +778,7 @@ void TileLangIREnableSoftPipeline::runOnOperation() {
                       << " expanded workspaces in function "
                       << func.getSymName() << "\n");
 
+    // 收集使用workspace的pipeline循环
     SmallVector<scf::ForOp> pipelineLoops;
     func.walk([&](scf::ForOp forOp) {
       if (forOp->getAttr("tilelangir.num_stages")) {
@@ -716,6 +806,7 @@ void TileLangIREnableSoftPipeline::runOnOperation() {
       }
     });
 
+    // Step 3: 处理每个pipeline循环
     for (auto forOp : pipelineLoops) {
       SoftPipelineProcessor processor(forOp, expandedWorkspaces);
       processor.process();
