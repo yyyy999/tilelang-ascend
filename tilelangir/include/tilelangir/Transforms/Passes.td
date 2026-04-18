@@ -139,6 +139,26 @@ def TileLangIREnableMultiBuffer : Pass<"tilelangir-enable-multi-buffer", "::mlir
   }];
 }
 
+def TileLangIREnableSoftPipeline : Pass<"tilelangir-enable-soft-pipeline", "::mlir::ModuleOp"> {
+  let summary = "TileLangIR Enable Soft Pipeline pass";
+  let description = [{
+    This pass transforms pipelined loops into soft-pipeline mode where
+    Cube and Vector operations from different stages can overlap execution.
+
+    Instead of creating separate inner loops for each scope (unroll mode),
+    this pass creates a single inner loop with scf.if dispatch, enabling
+    cross-stage CV overlap through embedded synchronization.
+
+    Transformation:
+    1. Expands workspace buffers with multi-buffer dimension.
+    2. Merges all ScopeOps into a single inner loop.
+    3. Dispatches each stage to a scf.if branch based on inner IV.
+    4. Inserts sync_block_wait/set within each branch.
+    5. Computes flag IDs as outerIV * num_stages + innerIV with modulo.
+    6. Inserts init/clear synchronization loops around the outer loop.
+  }];
+}
+
 def TileLangIREnableLocalBuffer : Pass<"tilelangir-enable-local-buffer", "::mlir::ModuleOp"> {
   let summary = "TileLangIR Enable Local Buffer pass";
   let description = [{

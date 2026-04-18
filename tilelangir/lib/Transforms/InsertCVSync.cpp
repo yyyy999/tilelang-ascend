@@ -111,6 +111,16 @@ void mlir::tilelangir::TileLangIRInsertCVSync::runOnOperation() {
   });
 
   for (scf::ForOp outer : outerLoops) {
+    // 检查外层循环内是否有 soft_pipeline 循环
+    // 如果有，同步已由 enable_soft_pipeline 处理，跳过
+    bool hasSoftPipeline = false;
+    outer.walk([&](scf::ForOp innerFor) {
+      if (innerFor->hasAttr("hivm.soft_pipeline"))
+        hasSoftPipeline = true;
+    });
+    if (hasSoftPipeline)
+      continue;
+
     // 重置计数器
     vectorFlagCnt = 0;
     cubeFlagCnt = 0;

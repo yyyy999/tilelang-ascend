@@ -72,6 +72,9 @@ static bool shouldDeleteComputationOp(Operation *op, bool isAIC) {
         return attr.getTcoretype() == TCoreType::CUBE;
       }
     }
+    // soft pipeline 循环不直接删除，后续在 filterSoftPipelineIfBranches 中处理
+    if (forOp->hasAttr("hivm.soft_pipeline"))
+      return false;
     // 没有标签的循环保留
     return false;
   }
@@ -92,6 +95,49 @@ static bool shouldDeleteComputationOp(Operation *op, bool isAIC) {
     }
   }
   return false;
+}
+
+// 判断 scf.if 分支内是否包含属于指定 core type 的操作
+static bool branchContainsCoreType(Block *block, bool isAIC) {
+  for (Operation &op : block->getOperations()) {
+    if (auto ctIface = dyn_cast<hivm::CoreTypeInterface>(&op)) {
+      auto ct = ctIface.getCoreType();
+      if (ct) {
+        if (isAIC && *ct == hivm::TCoreType::CUBE)
+          return true;
+        if (!isAIC && *ct == hivm::TCoreType::VECTOR)
+          return true;
+      }
+    }
+    for (Value operand : op.getOperands()) {
+      if (auto memRefType = operand.getType().dyn_cast<MemRefType>()) {
+        if (auto space = getMemSpaceString(memRefType)) {
+          if (isAIC && (*space == "cbuf" || *space == "cc"))
+            return true;
+          if (!isAIC && *space == "ub")
+            return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// 处理 soft pipeline 循环内的 scf.if 分支
+// AIC: 保留 CUBE 分支，清空 VECTOR 分支
+// AIV: 保留 VECTOR 分支，清空 CUBE 分支
+static void filterSoftPipelineIfBranches(func::FuncOp func, bool isAIC) {
+  func.walk<WalkOrder::PostOrder>([&](scf::IfOp ifOp) {
+    Block *thenBlock = &ifOp.getThenRegion().front();
+
+    bool shouldKeep = branchContainsCoreType(thenBlock, isAIC);
+    if (!shouldKeep) {
+      thenBlock->clear();
+      OpBuilder builder(ifOp->getContext());
+      builder.setInsertionPointToEnd(thenBlock);
+      builder.create<scf::YieldOp>(ifOp.getLoc());
+    }
+  });
 }
 
 // 判断该 Op 是否为 "内存资源申请类" Op (Alloc, View, Subview 等)
@@ -197,6 +243,14 @@ static LogicalResult splitMixKernel(func::FuncOp func) {
   // 过滤操作：使用修复后的鲁棒版本
   filterOpsRobust(func, true);   // AIC: 删除 Vector 和 UB 相关
   filterOpsRobust(aivFunc, false); // AIV: 删除 Cube 和 CBUF/CC 相关
+
+  // 处理 soft pipeline 循环内的 scf.if 分支
+  filterSoftPipelineIfBranches(func, true);   // AIC: 保留 CUBE 分支
+  filterSoftPipelineIfBranches(aivFunc, false); // AIV: 保留 VECTOR 分支
+
+  // 再次运行 DCE 清理空 scf.if 导致的死代码
+  filterOpsRobust(func, true);
+  filterOpsRobust(aivFunc, false);
 
   // 删除循环上的 tcore_type 属性
   stripLoopAttributes(func, TCoreType::CUBE);
