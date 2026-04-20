@@ -363,12 +363,24 @@ private:
       bool opErased = false;
       if (auto subview = dyn_cast<memref::SubViewOp>(&op)) {
         bool isWorkspace = false;
+        Value source = subview.getSource();
+        auto sourceType = source.getType().cast<MemRefType>();
+        
         for (Value ws : workspaceValues_) {
-          if (subview.getSource() == ws) {
+          if (source == ws) {
             isWorkspace = true;
             break;
           }
+          if (auto definingOp = source.getDefiningOp()) {
+            if (auto subviewSource = dyn_cast<memref::SubViewOp>(definingOp)) {
+              if (subviewSource.getSource() == ws) {
+                isWorkspace = true;
+                break;
+              }
+            }
+          }
         }
+        
         if (isWorkspace) {
           adjustWorkspaceSubview(subview, builder);
           opErased = true;
@@ -406,20 +418,12 @@ private:
     auto sourceType = source.getType().cast<MemRefType>();
     Value innerIV = innerFor_.getInductionVar();
 
-    llvm::errs() << "[adjustWorkspaceSubview] Processing subview:\n";
-    llvm::errs() << "  sourceType: " << sourceType << "\n";
-    llvm::errs() << "  sourceType rank: " << sourceType.getRank() << "\n";
-
     Value stageIndex =
         builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), innerIV);
 
     auto origOffsets = subview.getMixedOffsets();
     auto origSizes = subview.getMixedSizes();
     auto origStrides = subview.getMixedStrides();
-
-    llvm::errs() << "  origOffsets.size(): " << origOffsets.size() << "\n";
-    llvm::errs() << "  origSizes.size(): " << origSizes.size() << "\n";
-    llvm::errs() << "  origStrides.size(): " << origStrides.size() << "\n";
 
     int expandedSourceRank = sourceType.getRank();
     int originalSourceRank = expandedSourceRank - 1;
@@ -430,7 +434,6 @@ private:
     normalizedStrides.append(origStrides.begin(), origStrides.end());
 
     int missingDims = originalSourceRank - (int)origOffsets.size();
-    llvm::errs() << "  missingDims: " << missingDims << "\n";
     
     if (missingDims > 0) {
       for (int i = 0; i < missingDims; ++i) {
@@ -446,8 +449,6 @@ private:
         normalizedStrides.push_back(builder.getIndexAttr(1));
       }
     }
-
-    llvm::errs() << "  normalizedOffsets.size(): " << normalizedOffsets.size() << "\n";
 
     SmallVector<OpFoldResult> newOffsets, newSizes, newStrides;
     newOffsets.push_back(stageIndex);
@@ -471,30 +472,15 @@ private:
       newStrides.push_back(normalizedStrides[i]);
     }
 
-    llvm::errs() << "  newOffsets.size(): " << newOffsets.size() << "\n";
-    llvm::errs() << "  newSizes.size(): " << newSizes.size() << "\n";
-    llvm::errs() << "  newStrides.size(): " << newStrides.size() << "\n";
-    llvm::errs() << "  expected rank: " << expandedSourceRank << "\n";
-
     auto newSubview = builder.create<memref::SubViewOp>(loc, source, newOffsets,
                                                         newSizes, newStrides);
 
     auto subviewType = newSubview.getResult().getType().cast<MemRefType>();
-    llvm::errs() << "  newSubview type: " << subviewType << "\n";
-    llvm::errs() << "  newSubview rank: " << subviewType.getRank() << "\n";
-    llvm::errs() << "  newSubview shape: [";
-    for (int i = 0; i < subviewType.getRank(); ++i) {
-      if (i > 0) llvm::errs() << ", ";
-      llvm::errs() << subviewType.getDimSize(i);
-    }
-    llvm::errs() << "]\n";
-
     SmallVector<ReassociationIndices> reassociation;
     ReassociationIndices currentGroup;
     bool mergedLeadingOnes = false;
     for (int i = 0; i < subviewType.getRank(); ++i) {
       int64_t dimSize = subviewType.getDimSize(i);
-      llvm::errs() << "  dim[" << i << "] = " << dimSize << "\n";
       if (!mergedLeadingOnes && dimSize == 1) {
         currentGroup.push_back(i);
       } else {
@@ -511,18 +497,6 @@ private:
     if (!currentGroup.empty())
       reassociation.push_back(currentGroup);
 
-    llvm::errs() << "  reassociation: [";
-    for (size_t i = 0; i < reassociation.size(); ++i) {
-      if (i > 0) llvm::errs() << ", ";
-      llvm::errs() << "[";
-      for (size_t j = 0; j < reassociation[i].size(); ++j) {
-        if (j > 0) llvm::errs() << ", ";
-        llvm::errs() << reassociation[i][j];
-      }
-      llvm::errs() << "]";
-    }
-    llvm::errs() << "]\n";
-
     Value collapsed = builder.create<memref::CollapseShapeOp>(
         loc, newSubview.getResult(), reassociation);
     subview.getResult().replaceAllUsesWith(collapsed);
@@ -533,15 +507,43 @@ private:
   /// 使用新的外层索引表达式替换原始的外层循环变量
   void adjustGlobalSubviewOffset(memref::SubViewOp subview, Value newOuterI32,
                                  OpBuilder &builder) {
+    Location loc = subview.getLoc();
+    Value source = subview.getSource();
+    auto sourceType = source.getType().cast<MemRefType>();
+    
     auto origOffsets = subview.getMixedOffsets();
-    SmallVector<OpFoldResult> newOffsets;
+    auto origSizes = subview.getMixedSizes();
+    auto origStrides = subview.getMixedStrides();
 
-    for (size_t i = 0; i < origOffsets.size(); ++i) {
-      auto ofr = origOffsets[i];
+    // 处理隐式维度：填充缺失的维度
+    SmallVector<OpFoldResult> normalizedOffsets, normalizedSizes, normalizedStrides;
+    normalizedOffsets.append(origOffsets.begin(), origOffsets.end());
+    normalizedSizes.append(origSizes.begin(), origSizes.end());
+    normalizedStrides.append(origStrides.begin(), origStrides.end());
+
+    int missingDims = sourceType.getRank() - (int)origOffsets.size();
+    if (missingDims > 0) {
+      for (int i = 0; i < missingDims; ++i) {
+        int dimIdx = (int)normalizedOffsets.size();
+        normalizedOffsets.push_back(builder.getIndexAttr(0));
+        if (sourceType.isDynamicDim(dimIdx)) {
+          normalizedSizes.push_back(
+              builder.createOrFold<memref::DimOp>(loc, source, dimIdx));
+        } else {
+          normalizedSizes.push_back(
+              builder.getIndexAttr(sourceType.getDimSize(dimIdx)));
+        }
+        normalizedStrides.push_back(builder.getIndexAttr(1));
+      }
+    }
+
+    SmallVector<OpFoldResult> newOffsets;
+    for (size_t i = 0; i < normalizedOffsets.size(); ++i) {
+      auto ofr = normalizedOffsets[i];
       if (auto val = ofr.dyn_cast<Value>()) {
         if (val == outerFor_.getInductionVar()) {
           Value newIdx = builder.create<arith::IndexCastOp>(
-              subview.getLoc(), builder.getIndexType(), newOuterI32);
+              loc, builder.getIndexType(), newOuterI32);
           newOffsets.push_back(newIdx);
         } else {
           newOffsets.push_back(val);
@@ -552,8 +554,7 @@ private:
     }
 
     auto newSubview = builder.create<memref::SubViewOp>(
-        subview.getLoc(), subview.getSource(), newOffsets,
-        subview.getMixedSizes(), subview.getMixedStrides());
+        loc, source, newOffsets, normalizedSizes, normalizedStrides);
     subview.getResult().replaceAllUsesWith(newSubview.getResult());
     subview.erase();
   }
