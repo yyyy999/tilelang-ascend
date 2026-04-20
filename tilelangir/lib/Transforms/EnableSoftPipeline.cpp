@@ -271,14 +271,17 @@ public:
 
     Value flagBase = builder.create<arith::MulIOp>(loc, outerIVi64, numStagesI64);
     Value flagIdI64 = builder.create<arith::AddIOp>(loc, flagBase, innerIVi64);
-    // 计算下一个外层迭代的flag_id: flag_id_next = flag_id + num_stages
-    Value flagIdNextI64 =
-        builder.create<arith::AddIOp>(loc, flagIdI64, numStagesI64);
-    // 对flag_id取模，限制在SYNC_FLAGS_LIMIT范围内
-    Value flagIdMod =
-        builder.create<arith::RemSIOp>(loc, flagIdI64, syncLimitI64);
-    Value flagIdNextMod =
-        builder.create<arith::RemSIOp>(loc, flagIdNextI64, syncLimitI64);
+    // 统一且可证明闭环的 token 传递同步：
+    // - 每个 stage 先 wait(base)，再 set(base+1)
+    // - base = outer*numStages + inner
+    // 这样形成：stage0: 0->1, stage1:1->2, stage2:2->3, stage3:3->(next outer)0
+    Value flagIdMod = builder.create<arith::RemSIOp>(loc, flagIdI64, syncLimitI64);
+    Value flagIdPlusOneI64 = builder.create<arith::AddIOp>(
+        loc, flagIdI64,
+        builder.create<arith::ConstantOp>(loc, builder.getI64Type(),
+                                          builder.getI64IntegerAttr(1)));
+    Value flagIdPlusOneMod =
+        builder.create<arith::RemSIOp>(loc, flagIdPlusOneI64, syncLimitI64);
 
     Value stageIdx =
         builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), innerIV);
@@ -322,15 +325,9 @@ public:
 
       // 确定同步的核心类型和flag_id
       hivm::TCoreType waitCoreType = anotherCoreType(coreType);
-      // 统一使用取模后的 flag，避免 outer*stages 增大后 wait/set 永远匹配不上导致死锁。
-      //
-      // 约定：
-      // - stage 0/1：等待本次迭代 flagIdMod（由 init 或 stage0 set 提供）
-      // - stage >=2：等待 flagIdNextMod（由前一 stage 的 set 提供，形成跨外层迭代叠加）
-      // - stage 0：set flagIdMod
-      // - stage >0：set flagIdNextMod
-      Value waitFlagId = (stageIdx_ <= 1) ? flagIdMod : flagIdNextMod;
-      Value setFlagId = (stageIdx_ == 0) ? flagIdMod : flagIdNextMod;
+      // token 传递：wait(base) -> set(base+1)
+      Value waitFlagId = flagIdMod;
+      Value setFlagId = flagIdPlusOneMod;
 
       // 插入同步等待操作: 等待前一个stage完成
       buildCVSyncWait(builder, loc, waitCoreType, waitFlagId);
@@ -825,26 +822,23 @@ private:
       Block *clearBody = clearForOp.getBody();
       builder.setInsertionPointToStart(clearBody);
 
-      // 等待最后一次“触发 set”的 flag：
-      // 对 stage>0 的 set，flag 对应 (outer+1)*numStages + inner。
-      // 因为我们把 outer upperBound 改成了 newUpperBound = oldUpper/numStages，
-      // 所以最后一次 set 对应 outer = newUpperBound（比 lastOuter 多 1）。
-      Value innerIV = clearForOp.getInductionVar();
+      // token 方案下，最后一个 stage(stage=numStages-1) 会 set：
+      //   base = lastOuter*numStages + (numStages-1)
+      //   set = base + 1 = (lastOuter+1)*numStages + 0 = newUpperBound*numStages
+      // 因此 clear 只需要等待 finalToken = newUpperBound*numStages（再取模）。
+      (void)clearForOp.getInductionVar();
 
       Value numStagesI64 = builder.create<arith::ConstantOp>(
           loc, builder.getI64Type(), builder.getI64IntegerAttr(numStages));
 
-      Value lastOuterPlusOneI64 = convertToI64(builder, loc, newUpperBound);
-      Value innerIVi64 = convertToI64(builder, loc, innerIV);
-
-      Value flagBase =
-          builder.create<arith::MulIOp>(loc, lastOuterPlusOneI64, numStagesI64);
-      Value flagIdI64 = builder.create<arith::AddIOp>(loc, flagBase, innerIVi64);
+      Value outerPlusOneI64 = convertToI64(builder, loc, newUpperBound);
+      Value finalTokenI64 =
+          builder.create<arith::MulIOp>(loc, outerPlusOneI64, numStagesI64);
 
       Value syncLimitI64 = builder.create<arith::ConstantOp>(
           loc, builder.getI64Type(), builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
       Value flagIdMod =
-          builder.create<arith::RemSIOp>(loc, flagIdI64, syncLimitI64);
+          builder.create<arith::RemSIOp>(loc, finalTokenI64, syncLimitI64);
 
       buildCVSyncWait(builder, clearForOp->getLoc(), clearCoreType, flagIdMod);
     }
