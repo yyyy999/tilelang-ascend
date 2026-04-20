@@ -418,12 +418,17 @@ private:
     auto sourceType = source.getType().cast<MemRefType>();
     Value innerIV = innerFor_.getInductionVar();
 
+    llvm::errs() << "[adjustWorkspaceSubview] sourceType: " << sourceType 
+                 << ", rank=" << sourceType.getRank() << "\n";
+
     Value stageIndex =
         builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), innerIV);
 
     auto origOffsets = subview.getMixedOffsets();
     auto origSizes = subview.getMixedSizes();
     auto origStrides = subview.getMixedStrides();
+    
+    llvm::errs() << "  origOffsets.size()=" << origOffsets.size() << "\n";
 
     int expandedSourceRank = sourceType.getRank();
     int originalSourceRank = expandedSourceRank - 1;
@@ -434,6 +439,7 @@ private:
     normalizedStrides.append(origStrides.begin(), origStrides.end());
 
     int missingDims = originalSourceRank - (int)origOffsets.size();
+    llvm::errs() << "  missingDims=" << missingDims << "\n";
     
     if (missingDims > 0) {
       for (int i = 0; i < missingDims; ++i) {
@@ -476,6 +482,15 @@ private:
                                                         newSizes, newStrides);
 
     auto subviewType = newSubview.getResult().getType().cast<MemRefType>();
+    
+    llvm::errs() << "[adjustWorkspaceSubview] newSubview type: " << subviewType << "\n";
+    llvm::errs() << "  rank=" << subviewType.getRank() << ", shape=[";
+    for (int i = 0; i < subviewType.getRank(); ++i) {
+      if (i > 0) llvm::errs() << ", ";
+      llvm::errs() << subviewType.getDimSize(i);
+    }
+    llvm::errs() << "]\n";
+    
     SmallVector<ReassociationIndices> reassociation;
     ReassociationIndices currentGroup;
     bool mergedLeadingOnes = false;
@@ -496,6 +511,18 @@ private:
     }
     if (!currentGroup.empty())
       reassociation.push_back(currentGroup);
+
+    llvm::errs() << "  reassociation: [";
+    for (size_t i = 0; i < reassociation.size(); ++i) {
+      if (i > 0) llvm::errs() << ", ";
+      llvm::errs() << "[";
+      for (size_t j = 0; j < reassociation[i].size(); ++j) {
+        if (j > 0) llvm::errs() << ", ";
+        llvm::errs() << reassociation[i][j];
+      }
+      llvm::errs() << "]";
+    }
+    llvm::errs() << "]\n";
 
     Value collapsed = builder.create<memref::CollapseShapeOp>(
         loc, newSubview.getResult(), reassociation);
