@@ -413,13 +413,37 @@ private:
     auto origSizes = subview.getMixedSizes();
     auto origStrides = subview.getMixedStrides();
 
+    int expandedSourceRank = sourceType.getRank();
+    int originalSourceRank = expandedSourceRank - 1;
+
+    SmallVector<OpFoldResult> normalizedOffsets, normalizedSizes, normalizedStrides;
+    normalizedOffsets.append(origOffsets.begin(), origOffsets.end());
+    normalizedSizes.append(origSizes.begin(), origSizes.end());
+    normalizedStrides.append(origStrides.begin(), origStrides.end());
+
+    int missingDims = originalSourceRank - (int)origOffsets.size();
+    if (missingDims > 0) {
+      for (int i = 0; i < missingDims; ++i) {
+        int expandedDimIdx = (int)normalizedOffsets.size() + 1;
+        normalizedOffsets.push_back(builder.getIndexAttr(0));
+        if (sourceType.isDynamicDim(expandedDimIdx)) {
+          normalizedSizes.push_back(
+              builder.createOrFold<memref::DimOp>(loc, source, expandedDimIdx));
+        } else {
+          normalizedSizes.push_back(
+              builder.getIndexAttr(sourceType.getDimSize(expandedDimIdx)));
+        }
+        normalizedStrides.push_back(builder.getIndexAttr(1));
+      }
+    }
+
     SmallVector<OpFoldResult> newOffsets, newSizes, newStrides;
     newOffsets.push_back(stageIndex);
     newSizes.push_back(builder.getIndexAttr(1));
     newStrides.push_back(builder.getIndexAttr(1));
 
-    for (size_t i = 0; i < origOffsets.size(); ++i) {
-      auto ofr = origOffsets[i];
+    for (size_t i = 0; i < normalizedOffsets.size(); ++i) {
+      auto ofr = normalizedOffsets[i];
       if (auto val = ofr.dyn_cast<Value>()) {
         if (val == outerFor_.getInductionVar()) {
           newOffsets.push_back(
@@ -431,14 +455,14 @@ private:
       } else {
         newOffsets.push_back(ofr);
       }
-      newSizes.push_back(origSizes[i]);
-      newStrides.push_back(origStrides[i]);
+      newSizes.push_back(normalizedSizes[i]);
+      newStrides.push_back(normalizedStrides[i]);
     }
 
     auto newSubview = builder.create<memref::SubViewOp>(loc, source, newOffsets,
                                                         newSizes, newStrides);
-    auto subviewType = newSubview.getResult().getType().cast<MemRefType>();
 
+    auto subviewType = newSubview.getResult().getType().cast<MemRefType>();
     SmallVector<ReassociationIndices> reassociation;
     ReassociationIndices currentGroup;
     bool mergedLeadingOnes = false;
@@ -539,8 +563,8 @@ private:
 
     auto subviewOp = builder.create<memref::SubViewOp>(loc, ws, offsets, sizes,
                                                        strides);
-    auto subviewType = subviewOp.getResult().getType().cast<MemRefType>();
 
+    auto subviewType = subviewOp.getResult().getType().cast<MemRefType>();
     SmallVector<ReassociationIndices> reassociation;
     ReassociationIndices currentGroup;
     bool mergedLeadingOnes = false;
