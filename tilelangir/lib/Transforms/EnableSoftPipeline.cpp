@@ -360,6 +360,7 @@ private:
     Value outerIV = outerFor_.getInductionVar();
 
     for (Operation &op : llvm::make_early_inc_range(*thenBlock)) {
+      bool opErased = false;
       if (auto subview = dyn_cast<memref::SubViewOp>(&op)) {
         bool isWorkspace = false;
         for (Value ws : workspaceValues_) {
@@ -370,17 +371,23 @@ private:
         }
         if (isWorkspace) {
           adjustWorkspaceSubview(subview, builder);
+          opErased = true;
         } else {
           adjustGlobalSubviewOffset(subview, newOuterExprI32, builder);
+          opErased = true;
         }
       } else if (auto copyOp = dyn_cast<memref::CopyOp>(&op)) {
         for (Value ws : workspaceValues_) {
           if (copyOp.getSource() == ws || copyOp.getTarget() == ws) {
             adjustCopyOp(copyOp, builder);
+            opErased = true;
             break;
           }
         }
       }
+
+      if (opErased)
+        continue;
 
       for (unsigned i = 0; i < op.getNumOperands(); ++i) {
         if (op.getOperand(i) == outerIV) {
@@ -636,7 +643,7 @@ public:
     bool changed = converter.convert();
 
     if (changed) {
-      insertInitAndClear(pipelineLoop_, numStages, beginCoreType, endCoreType, oldUpper);
+      insertInitAndClear(pipelineLoop_, numStages, beginCoreType, endCoreType, newUpper);
     }
 
     return changed;
@@ -651,11 +658,11 @@ private:
   ///
   /// Clear循环: 在主循环后等待最后的操作完成
   ///   for j = 0 to num_stages:
-  ///     sync_block_wait[clearCoreType](outerIV * num_stages + j)
+  ///     sync_block_wait[clearCoreType]((newUpper - 1) * num_stages + j)
   void insertInitAndClear(scf::ForOp outerFor, int32_t numStages,
                           hivm::TCoreType beginCoreType,
                           hivm::TCoreType endCoreType,
-                          Value originalUpperBound) {
+                          Value newUpperBound) {
     if (beginCoreType == hivm::TCoreType::CUBE_OR_VECTOR)
       return;
 
@@ -706,18 +713,22 @@ private:
       Block *clearBody = clearForOp.getBody();
       builder.setInsertionPointToStart(clearBody);
 
-      // 计算clear的flag_id: outerIV * num_stages + innerIV
+      // 计算clear的flag_id: (newUpper - 1) * num_stages + innerIV
       // 等待最后一次外层迭代的对应stage完成
-      Value outerIV = outerFor.getInductionVar();
       Value innerIV = clearForOp.getInductionVar();
+
+      // 计算 lastOuterIV = newUpperBound - 1
+      Value c1I32 = builder.create<arith::ConstantOp>(
+          loc, builder.getI32Type(), builder.getI32IntegerAttr(1));
+      Value lastOuterIV = builder.create<arith::SubIOp>(loc, newUpperBound, c1I32);
 
       Value numStagesI64 = builder.create<arith::ConstantOp>(
           loc, builder.getI64Type(), builder.getI64IntegerAttr(numStages));
 
-      Value outerIVi64 = convertToI64(builder, loc, outerIV);
+      Value lastOuterIVi64 = convertToI64(builder, loc, lastOuterIV);
       Value innerIVi64 = convertToI64(builder, loc, innerIV);
 
-      Value flagBase = builder.create<arith::MulIOp>(loc, outerIVi64, numStagesI64);
+      Value flagBase = builder.create<arith::MulIOp>(loc, lastOuterIVi64, numStagesI64);
       Value flagIdI64 = builder.create<arith::AddIOp>(loc, flagBase, innerIVi64);
 
       Value syncLimitI64 = builder.create<arith::ConstantOp>(
