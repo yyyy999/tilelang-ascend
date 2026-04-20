@@ -27,6 +27,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -212,7 +213,10 @@ public:
                         ArrayRef<scope::ScopeOp> scopeOps,
                         ArrayRef<Value> workspaceValues, int32_t numStages)
       : outerFor_(outerFor), scopeOps_(scopeOps),
-        workspaceValues_(workspaceValues), numStages_(numStages) {}
+        workspaceValues_(workspaceValues), numStages_(numStages) {
+    for (Value ws : workspaceValues_)
+      workspaceValueSet_.insert(ws);
+  }
 
   /// 核心转换方法
   /// 将外层循环内的多个ScopeOp转换为软流水结构
@@ -223,6 +227,17 @@ public:
     OpBuilder builder(outerFor_);
     Location loc = outerFor_.getLoc();
     Value outerIV = outerFor_.getInductionVar();
+
+    // 关键：innerFor 必须插入到 outerFor 的 body 内部。
+    //
+    // 同时，为了保持原先 scope 之前定义的值（例如 index_cast 得到的 offset）对 scope 内部使用的 dominance，
+    // innerFor 应当插入在“第一个 ScopeOp 的位置”，而不是 outer body 的开头。
+    // 否则会把 scope 内部的 use 移到这些定义之前，触发 dominance 错误。
+    if (!scopeOps_.empty() && scopeOps_.front()->getBlock() == outerFor_.getBody()) {
+      builder.setInsertionPoint(scopeOps_.front());
+    } else {
+      builder.setInsertionPointToStart(outerFor_.getBody());
+    }
 
     // 创建常量: 0, num_stages, 1
     Value c0 = builder.create<arith::ConstantOp>(loc, builder.getI32Type(),
@@ -236,8 +251,9 @@ public:
     auto innerFor = builder.create<scf::ForOp>(loc, c0, cNumStages, c1,
                                                ValueRange{});
     innerFor->setAttr("hivm.soft_pipeline", builder.getUnitAttr());
-    innerFor->setAttr("tilelangir.num_stages",
-                      builder.getI32IntegerAttr(numStages_));
+    // 注意：不要在 soft-pipeline 内层循环上再打 tilelangir.num_stages，
+    // 该属性语义属于外层 pipeline loop。打在这里会让下游/其他扫描逻辑把内层也当成 pipeline loop，
+    // 增加不必要的遍历成本，甚至导致重复处理的风险。
 
     Block *innerBody = innerFor.getBody();
     Operation *terminator = innerBody->getTerminator();
@@ -306,14 +322,15 @@ public:
 
       // 确定同步的核心类型和flag_id
       hivm::TCoreType waitCoreType = anotherCoreType(coreType);
-      Value waitFlagId = flagIdMod;
-      Value setFlagId = flagIdNextMod;
-
-      // 第一个stage使用原始flag_id（不跨外层迭代）
-      if (stageIdx_ == 0) {
-        waitFlagId = flagIdI64;
-        setFlagId = flagIdI64;
-      }
+      // 统一使用取模后的 flag，避免 outer*stages 增大后 wait/set 永远匹配不上导致死锁。
+      //
+      // 约定：
+      // - stage 0/1：等待本次迭代 flagIdMod（由 init 或 stage0 set 提供）
+      // - stage >=2：等待 flagIdNextMod（由前一 stage 的 set 提供，形成跨外层迭代叠加）
+      // - stage 0：set flagIdMod
+      // - stage >0：set flagIdNextMod
+      Value waitFlagId = (stageIdx_ <= 1) ? flagIdMod : flagIdNextMod;
+      Value setFlagId = (stageIdx_ == 0) ? flagIdMod : flagIdNextMod;
 
       // 插入同步等待操作: 等待前一个stage完成
       buildCVSyncWait(builder, loc, waitCoreType, waitFlagId);
@@ -351,6 +368,31 @@ public:
   }
 
 private:
+  // 追踪 view-like 链（subview/view/reinterpret_cast），返回根 source。
+  // 用于快速判断某个值是否源自 workspace，避免在大 IR 上反复线性扫描 workspaceValues_。
+  static Value getViewLikeRoot(Value v) {
+    while (Operation *def = v.getDefiningOp()) {
+      if (auto sv = dyn_cast<memref::SubViewOp>(def)) {
+        v = sv.getSource();
+        continue;
+      }
+      if (auto view = dyn_cast<memref::ViewOp>(def)) {
+        v = view.getSource();
+        continue;
+      }
+      if (auto rc = dyn_cast<memref::ReinterpretCastOp>(def)) {
+        v = rc.getSource();
+        continue;
+      }
+      break;
+    }
+    return v;
+  }
+
+  bool isWorkspaceValue(Value v) const {
+    return workspaceValueSet_.contains(getViewLikeRoot(v));
+  }
+
   /// 调整scf.if分支内的操作
   /// 包括: workspace subview调整、全局内存偏移调整、copy操作调整
   void adjustOperationsInBranch(Block *thenBlock, Value newOuterExprI32,
@@ -359,52 +401,48 @@ private:
     Value innerIV = innerFor_.getInductionVar();
     Value outerIV = outerFor_.getInductionVar();
 
-    for (Operation &op : llvm::make_early_inc_range(*thenBlock)) {
-      bool opErased = false;
-      if (auto subview = dyn_cast<memref::SubViewOp>(&op)) {
-        bool isWorkspace = false;
-        Value source = subview.getSource();
-        auto sourceType = source.getType().cast<MemRefType>();
-        
-        for (Value ws : workspaceValues_) {
-          if (source == ws) {
-            isWorkspace = true;
-            break;
-          }
-          if (auto definingOp = source.getDefiningOp()) {
-            if (auto subviewSource = dyn_cast<memref::SubViewOp>(definingOp)) {
-              if (subviewSource.getSource() == ws) {
-                isWorkspace = true;
-                break;
-              }
-            }
-          }
-        }
-        
-        if (isWorkspace) {
-          adjustWorkspaceSubview(subview, builder);
-          opErased = true;
-        } else {
-          adjustGlobalSubviewOffset(subview, newOuterExprI32, builder);
-          opErased = true;
-        }
-      } else if (auto copyOp = dyn_cast<memref::CopyOp>(&op)) {
-        for (Value ws : workspaceValues_) {
-          if (copyOp.getSource() == ws || copyOp.getTarget() == ws) {
-            adjustCopyOp(copyOp, builder);
-            opErased = true;
-            break;
-          }
-        }
-      }
+    // 重要：不要在遍历 block 的同时在同一 block 中插入新的 subview/copy，
+    // 否则新插入的 op 可能在同一轮遍历中再次被命中，造成重复改写甚至指令膨胀（opt 看起来像“卡住”）。
+    SmallVector<Operation *> opsSnapshot;
+    opsSnapshot.reserve(thenBlock->getOperations().size());
+    for (Operation &op : thenBlock->getOperations())
+      opsSnapshot.push_back(&op);
 
-      if (opErased)
+    // Step 1: 先处理 subview/copy（会插入新 op 并 erase 原 op）
+    for (Operation *op : opsSnapshot) {
+      if (!op || op->getBlock() != thenBlock)
+        continue; // 已被 erase 或搬走
+      if (op->hasTrait<OpTrait::IsTerminator>())
         continue;
 
-      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
-        if (op.getOperand(i) == outerIV) {
-          op.setOperand(i, newOuterExprIdx);
+      if (auto subview = dyn_cast<memref::SubViewOp>(op)) {
+        builder.setInsertionPoint(subview);
+        if (isWorkspaceValue(subview.getSource()))
+          adjustWorkspaceSubview(subview, builder);
+        else
+          adjustGlobalSubviewOffset(subview, newOuterExprI32, builder);
+        continue;
+      }
+
+      if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
+        if (isWorkspaceValue(copyOp.getSource()) ||
+            isWorkspaceValue(copyOp.getTarget())) {
+          builder.setInsertionPoint(copyOp);
+          adjustCopyOp(copyOp, builder);
         }
+        continue;
+      }
+    }
+
+    // Step 2: 再做通用的 outerIV operand 替换（只针对快照里的原始 op）
+    for (Operation *op : opsSnapshot) {
+      if (!op || op->getBlock() != thenBlock)
+        continue;
+      if (op->hasTrait<OpTrait::IsTerminator>())
+        continue;
+      for (OpOperand &operand : op->getOpOperands()) {
+        if (operand.get() == outerIV)
+          operand.set(newOuterExprIdx);
       }
     }
   }
@@ -418,17 +456,12 @@ private:
     auto sourceType = source.getType().cast<MemRefType>();
     Value innerIV = innerFor_.getInductionVar();
 
-    llvm::errs() << "[adjustWorkspaceSubview] sourceType: " << sourceType 
-                 << ", rank=" << sourceType.getRank() << "\n";
-
     Value stageIndex =
         builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), innerIV);
 
     auto origOffsets = subview.getMixedOffsets();
     auto origSizes = subview.getMixedSizes();
     auto origStrides = subview.getMixedStrides();
-    
-    llvm::errs() << "  origOffsets.size()=" << origOffsets.size() << "\n";
 
     int expandedSourceRank = sourceType.getRank();
     int originalSourceRank = expandedSourceRank - 1;
@@ -438,8 +471,11 @@ private:
     normalizedSizes.append(origSizes.begin(), origSizes.end());
     normalizedStrides.append(origStrides.begin(), origStrides.end());
 
+    // 一些 subview 可能是 rank-reducing 的，mixedOffsets 数量可能大于/小于期望值。
+    // 这里缺失维度只在为 source 追加隐式维度时才有意义，因此保证它不为负，避免刷屏/异常行为。
     int missingDims = originalSourceRank - (int)origOffsets.size();
-    llvm::errs() << "  missingDims=" << missingDims << "\n";
+    if (missingDims < 0)
+      missingDims = 0;
     
     if (missingDims > 0) {
       for (int i = 0; i < missingDims; ++i) {
@@ -478,55 +514,35 @@ private:
       newStrides.push_back(normalizedStrides[i]);
     }
 
-    auto newSubview = builder.create<memref::SubViewOp>(loc, source, newOffsets,
-                                                        newSizes, newStrides);
+    // 先创建全 rank 的 subview，让 MLIR 推导出正确的 strided layout / offset。
+    // 然后再通过 collapse_shape 折叠“前缀维度”，得到和原 subview 等 rank 的结果，
+    // 避免直接指定 result type 导致 layout mismatch（尤其是 offset: ?>）。
+    auto fullSubview =
+        builder.create<memref::SubViewOp>(loc, source, newOffsets, newSizes, newStrides);
 
-    auto subviewType = newSubview.getResult().getType().cast<MemRefType>();
-    
-    llvm::errs() << "[adjustWorkspaceSubview] newSubview type: " << subviewType << "\n";
-    llvm::errs() << "  rank=" << subviewType.getRank() << ", shape=[";
-    for (int i = 0; i < subviewType.getRank(); ++i) {
-      if (i > 0) llvm::errs() << ", ";
-      llvm::errs() << subviewType.getDimSize(i);
-    }
-    llvm::errs() << "]\n";
-    
-    SmallVector<ReassociationIndices> reassociation;
-    ReassociationIndices currentGroup;
-    bool mergedLeadingOnes = false;
-    for (int i = 0; i < subviewType.getRank(); ++i) {
-      int64_t dimSize = subviewType.getDimSize(i);
-      if (!mergedLeadingOnes && dimSize == 1) {
-        currentGroup.push_back(i);
-      } else {
-        if (!currentGroup.empty()) {
-          currentGroup.push_back(i);
-          reassociation.push_back(currentGroup);
-          currentGroup.clear();
-          mergedLeadingOnes = true;
-        } else {
-          reassociation.push_back({i});
-        }
-      }
-    }
-    if (!currentGroup.empty())
-      reassociation.push_back(currentGroup);
+    Value replacement = fullSubview.getResult();
+    int fullRank =
+        replacement.getType().cast<MemRefType>().getRank();
+    int targetRank = subview.getType().cast<MemRefType>().getRank();
 
-    llvm::errs() << "  reassociation: [";
-    for (size_t i = 0; i < reassociation.size(); ++i) {
-      if (i > 0) llvm::errs() << ", ";
-      llvm::errs() << "[";
-      for (size_t j = 0; j < reassociation[i].size(); ++j) {
-        if (j > 0) llvm::errs() << ", ";
-        llvm::errs() << reassociation[i][j];
-      }
-      llvm::errs() << "]";
-    }
-    llvm::errs() << "]\n";
+    if (fullRank > targetRank) {
+      // 折叠前缀维度，使 rank 变为 targetRank：
+      // firstGroup = [0 .. fullRank-targetRank]
+      // remaining = singleton groups
+      SmallVector<ReassociationIndices> reassociation;
+      reassociation.reserve(targetRank);
+      ReassociationIndices firstGroup;
+      for (int i = 0; i <= fullRank - targetRank; ++i)
+        firstGroup.push_back(i);
+      reassociation.push_back(std::move(firstGroup));
+      for (int i = fullRank - targetRank + 1; i < fullRank; ++i)
+        reassociation.push_back({i});
 
-    Value collapsed = builder.create<memref::CollapseShapeOp>(
-        loc, newSubview.getResult(), reassociation);
-    subview.getResult().replaceAllUsesWith(collapsed);
+      replacement = builder.create<memref::CollapseShapeOp>(
+          loc, replacement, reassociation);
+    }
+
+    subview.getResult().replaceAllUsesWith(replacement);
     subview.erase();
   }
 
@@ -549,6 +565,8 @@ private:
     normalizedStrides.append(origStrides.begin(), origStrides.end());
 
     int missingDims = sourceType.getRank() - (int)origOffsets.size();
+    if (missingDims < 0)
+      missingDims = 0;
     if (missingDims > 0) {
       for (int i = 0; i < missingDims; ++i) {
         int dimIdx = (int)normalizedOffsets.size();
@@ -668,6 +686,7 @@ private:
   scf::ForOp innerFor_;
   SmallVector<scope::ScopeOp> scopeOps_;
   SmallVector<Value> workspaceValues_;
+  llvm::DenseSet<Value> workspaceValueSet_;
   int32_t numStages_;
   Value newOuterExprI32_;
 };
@@ -757,10 +776,12 @@ private:
     if (beginCoreType == hivm::TCoreType::CUBE_OR_VECTOR)
       return;
 
-    OpBuilder builder(outerFor->getContext());
+    // Builder 必须有合法插入点，否则 create(...) 可能触发断言/崩溃。
+    OpBuilder builder(outerFor);
     Location loc = outerFor->getLoc();
 
     // 创建常量
+    builder.setInsertionPoint(outerFor);
     Value c0 = builder.create<arith::ConstantOp>(
         loc, builder.getI32Type(), builder.getI32IntegerAttr(0));
     Value cNumStages = builder.create<arith::ConstantOp>(
@@ -788,9 +809,9 @@ private:
       buildCVSyncSet(builder, initForOp->getLoc(), initCoreType, initId);
     }
 
-    // Clear核心类型: 与最后一个stage的核心类型相反
-    // 如果最后一个stage是VECTOR，则需要等待CUBE标志
-    hivm::TCoreType clearCoreType = anotherCoreType(endCoreType);
+    // Clear：等待最后一个 stage 的 set 生效，确保流水线排空。
+    // 最后一个 stage 会 set 自己的 coreType 的 flag，因此这里等待 endCoreType。
+    hivm::TCoreType clearCoreType = endCoreType;
 
     // 创建Clear循环
     builder.setInsertionPointAfter(outerFor);
@@ -804,22 +825,20 @@ private:
       Block *clearBody = clearForOp.getBody();
       builder.setInsertionPointToStart(clearBody);
 
-      // 计算clear的flag_id: (newUpper - 1) * num_stages + innerIV
-      // 等待最后一次外层迭代的对应stage完成
+      // 等待最后一次“触发 set”的 flag：
+      // 对 stage>0 的 set，flag 对应 (outer+1)*numStages + inner。
+      // 因为我们把 outer upperBound 改成了 newUpperBound = oldUpper/numStages，
+      // 所以最后一次 set 对应 outer = newUpperBound（比 lastOuter 多 1）。
       Value innerIV = clearForOp.getInductionVar();
-
-      // 计算 lastOuterIV = newUpperBound - 1
-      Value c1I32 = builder.create<arith::ConstantOp>(
-          loc, builder.getI32Type(), builder.getI32IntegerAttr(1));
-      Value lastOuterIV = builder.create<arith::SubIOp>(loc, newUpperBound, c1I32);
 
       Value numStagesI64 = builder.create<arith::ConstantOp>(
           loc, builder.getI64Type(), builder.getI64IntegerAttr(numStages));
 
-      Value lastOuterIVi64 = convertToI64(builder, loc, lastOuterIV);
+      Value lastOuterPlusOneI64 = convertToI64(builder, loc, newUpperBound);
       Value innerIVi64 = convertToI64(builder, loc, innerIV);
 
-      Value flagBase = builder.create<arith::MulIOp>(loc, lastOuterIVi64, numStagesI64);
+      Value flagBase =
+          builder.create<arith::MulIOp>(loc, lastOuterPlusOneI64, numStagesI64);
       Value flagIdI64 = builder.create<arith::AddIOp>(loc, flagBase, innerIVi64);
 
       Value syncLimitI64 = builder.create<arith::ConstantOp>(
@@ -885,22 +904,31 @@ void TileLangIREnableSoftPipeline::runOnOperation() {
     func.walk([&](scf::ForOp forOp) {
       if (forOp->getAttr("tilelangir.num_stages")) {
         bool usesAnyWs = false;
-        forOp.walk([&](Operation *op) {
+        // 注意：这里在大 IR 上可能非常慢。找到任意 workspace 使用后应立即中断 walk，
+        // 否则会继续遍历整个 loop body，看起来像 opt “卡住”。
+        (void)forOp.walk([&](Operation *op) -> WalkResult {
+          if (usesAnyWs)
+            return WalkResult::interrupt();
+
           if (auto sv = dyn_cast<memref::SubViewOp>(op)) {
+            Value src = sv.getSource();
             for (Value ws : expandedWorkspaces) {
-              if (sv.getSource() == ws) {
+              if (src == ws) {
                 usesAnyWs = true;
-                return;
+                return WalkResult::interrupt();
               }
             }
           } else if (auto cp = dyn_cast<memref::CopyOp>(op)) {
+            Value src = cp.getSource();
+            Value dst = cp.getTarget();
             for (Value ws : expandedWorkspaces) {
-              if (cp.getSource() == ws || cp.getTarget() == ws) {
+              if (src == ws || dst == ws) {
                 usesAnyWs = true;
-                return;
+                return WalkResult::interrupt();
               }
             }
           }
+          return WalkResult::advance();
         });
         if (usesAnyWs) {
           pipelineLoops.push_back(forOp);
