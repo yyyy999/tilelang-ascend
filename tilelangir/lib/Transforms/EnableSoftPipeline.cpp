@@ -406,12 +406,20 @@ private:
     auto sourceType = source.getType().cast<MemRefType>();
     Value innerIV = innerFor_.getInductionVar();
 
+    llvm::errs() << "[adjustWorkspaceSubview] Processing subview:\n";
+    llvm::errs() << "  sourceType: " << sourceType << "\n";
+    llvm::errs() << "  sourceType rank: " << sourceType.getRank() << "\n";
+
     Value stageIndex =
         builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), innerIV);
 
     auto origOffsets = subview.getMixedOffsets();
     auto origSizes = subview.getMixedSizes();
     auto origStrides = subview.getMixedStrides();
+
+    llvm::errs() << "  origOffsets.size(): " << origOffsets.size() << "\n";
+    llvm::errs() << "  origSizes.size(): " << origSizes.size() << "\n";
+    llvm::errs() << "  origStrides.size(): " << origStrides.size() << "\n";
 
     int expandedSourceRank = sourceType.getRank();
     int originalSourceRank = expandedSourceRank - 1;
@@ -422,6 +430,8 @@ private:
     normalizedStrides.append(origStrides.begin(), origStrides.end());
 
     int missingDims = originalSourceRank - (int)origOffsets.size();
+    llvm::errs() << "  missingDims: " << missingDims << "\n";
+    
     if (missingDims > 0) {
       for (int i = 0; i < missingDims; ++i) {
         int expandedDimIdx = (int)normalizedOffsets.size() + 1;
@@ -436,6 +446,8 @@ private:
         normalizedStrides.push_back(builder.getIndexAttr(1));
       }
     }
+
+    llvm::errs() << "  normalizedOffsets.size(): " << normalizedOffsets.size() << "\n";
 
     SmallVector<OpFoldResult> newOffsets, newSizes, newStrides;
     newOffsets.push_back(stageIndex);
@@ -459,15 +471,30 @@ private:
       newStrides.push_back(normalizedStrides[i]);
     }
 
+    llvm::errs() << "  newOffsets.size(): " << newOffsets.size() << "\n";
+    llvm::errs() << "  newSizes.size(): " << newSizes.size() << "\n";
+    llvm::errs() << "  newStrides.size(): " << newStrides.size() << "\n";
+    llvm::errs() << "  expected rank: " << expandedSourceRank << "\n";
+
     auto newSubview = builder.create<memref::SubViewOp>(loc, source, newOffsets,
                                                         newSizes, newStrides);
 
     auto subviewType = newSubview.getResult().getType().cast<MemRefType>();
+    llvm::errs() << "  newSubview type: " << subviewType << "\n";
+    llvm::errs() << "  newSubview rank: " << subviewType.getRank() << "\n";
+    llvm::errs() << "  newSubview shape: [";
+    for (int i = 0; i < subviewType.getRank(); ++i) {
+      if (i > 0) llvm::errs() << ", ";
+      llvm::errs() << subviewType.getDimSize(i);
+    }
+    llvm::errs() << "]\n";
+
     SmallVector<ReassociationIndices> reassociation;
     ReassociationIndices currentGroup;
     bool mergedLeadingOnes = false;
     for (int i = 0; i < subviewType.getRank(); ++i) {
       int64_t dimSize = subviewType.getDimSize(i);
+      llvm::errs() << "  dim[" << i << "] = " << dimSize << "\n";
       if (!mergedLeadingOnes && dimSize == 1) {
         currentGroup.push_back(i);
       } else {
@@ -483,6 +510,18 @@ private:
     }
     if (!currentGroup.empty())
       reassociation.push_back(currentGroup);
+
+    llvm::errs() << "  reassociation: [";
+    for (size_t i = 0; i < reassociation.size(); ++i) {
+      if (i > 0) llvm::errs() << ", ";
+      llvm::errs() << "[";
+      for (size_t j = 0; j < reassociation[i].size(); ++j) {
+        if (j > 0) llvm::errs() << ", ";
+        llvm::errs() << reassociation[i][j];
+      }
+      llvm::errs() << "]";
+    }
+    llvm::errs() << "]\n";
 
     Value collapsed = builder.create<memref::CollapseShapeOp>(
         loc, newSubview.getResult(), reassociation);
