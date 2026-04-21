@@ -610,8 +610,10 @@ public:
 
 private:
   /// Init: set VEC(L-1) so that (outer=0, inner=0) wait VEC(t-1 = -1 mod L)
-  /// can proceed.
-  /// Clear: wait for the last stage's set flag = (N*S - 1) % L.
+  /// can proceed.  Runs on anotherCoreType(beginCoreType).
+  /// Clear: cross-core wait for the last stage's flag = (N*S - 1) % L.
+  /// Runs on anotherCoreType(endCoreType) so that after SplitMixKernel
+  /// the "fast" core blocks before entering the next outer iteration.
   void insertInitAndClear(scf::ForOp outerFor, int32_t numStages,
                           hivm::TCoreType beginCoreType,
                           hivm::TCoreType endCoreType) {
@@ -645,8 +647,12 @@ private:
       buildCVSyncSet(builder, loc, initCoreType, initFlagI64);
     }
 
-    // --- Clear: single wait for last flag ---
-    hivm::TCoreType clearCoreType = endCoreType;
+    // --- Clear: cross-core wait for last flag ---
+    // The clear loop runs on the OPPOSITE core of the last stage so that
+    // after SplitMixKernel the "fast" core cannot race ahead to the next
+    // outer iteration and steal the flag that the "slow" core still needs.
+    // The wait itself targets endCoreType's flag (cross-core barrier).
+    hivm::TCoreType clearLoopCoreType = anotherCoreType(endCoreType);
     Value upperBound = outerFor.getUpperBound();
 
     if (std::optional<int64_t> trip = getConstantIntValue(upperBound);
@@ -657,7 +663,7 @@ private:
     builder.setInsertionPointAfter(outerFor);
     auto clearForOp = builder.create<scf::ForOp>(loc, c0, c1, c1);
     auto clearCoreTypeAttr =
-        mlir::hivm::TCoreTypeAttr::get(builder.getContext(), clearCoreType);
+        mlir::hivm::TCoreTypeAttr::get(builder.getContext(), clearLoopCoreType);
     clearForOp->setAttr(hivm::TCoreTypeAttr::name, clearCoreTypeAttr);
     {
       OpBuilder::InsertionGuard guard(builder);
@@ -680,7 +686,7 @@ private:
       Value flagMod =
           builder.create<arith::RemSIOp>(loc, lastT, syncLimitI64);
 
-      buildCVSyncWait(builder, loc, clearCoreType, flagMod);
+      buildCVSyncWait(builder, loc, endCoreType, flagMod);
     }
   }
 
