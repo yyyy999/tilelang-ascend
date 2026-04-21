@@ -25,11 +25,15 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/LogicalResult.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <array>
+#include <optional>
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
@@ -89,6 +93,15 @@ static MemRefType expandMemRefType(MemRefType oldType, int32_t multiBuffer) {
   }
   return MemRefType::get(newShape, oldType.getElementType(), newLayout,
                          oldType.getMemorySpace());
+}
+
+/// 若值为 arith.constant，返回其整数值（用于静态核对 sync flag）
+static std::optional<int64_t> getConstantIntValue(Value value) {
+  if (auto constOp = value.getDefiningOp<arith::ConstantOp>()) {
+    if (auto intAttr = constOp.getValue().dyn_cast_or_null<IntegerAttr>())
+      return intAttr.getInt();
+  }
+  return std::nullopt;
 }
 
 /// 将值转换为i64类型，用于同步标志计算
@@ -271,17 +284,14 @@ public:
 
     Value flagBase = builder.create<arith::MulIOp>(loc, outerIVi64, numStagesI64);
     Value flagIdI64 = builder.create<arith::AddIOp>(loc, flagBase, innerIVi64);
-    // 统一且可证明闭环的 token 传递同步：
-    // - 每个 stage 先 wait(base)，再 set(base+1)
-    // - base = outer*numStages + inner
-    // 这样形成：stage0: 0->1, stage1:1->2, stage2:2->3, stage3:3->(next outer)0
-    Value flagIdMod = builder.create<arith::RemSIOp>(loc, flagIdI64, syncLimitI64);
-    Value flagIdPlusOneI64 = builder.create<arith::AddIOp>(
-        loc, flagIdI64,
-        builder.create<arith::ConstantOp>(loc, builder.getI64Type(),
-                                          builder.getI64IntegerAttr(1)));
-    Value flagIdPlusOneMod =
-        builder.create<arith::RemSIOp>(loc, flagIdPlusOneI64, syncLimitI64);
+    // 计算下一个外层迭代的flag_id: flag_id_next = flag_id + num_stages
+    Value flagIdNextI64 =
+        builder.create<arith::AddIOp>(loc, flagIdI64, numStagesI64);
+    // 对flag_id取模，限制在SYNC_FLAGS_LIMIT范围内
+    Value flagIdMod =
+        builder.create<arith::RemSIOp>(loc, flagIdI64, syncLimitI64);
+    Value flagIdNextMod =
+        builder.create<arith::RemSIOp>(loc, flagIdNextI64, syncLimitI64);
 
     Value stageIdx =
         builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), innerIV);
@@ -325,9 +335,15 @@ public:
 
       // 确定同步的核心类型和flag_id
       hivm::TCoreType waitCoreType = anotherCoreType(coreType);
-      // token 传递：wait(base) -> set(base+1)
-      Value waitFlagId = flagIdMod;
-      Value setFlagId = flagIdPlusOneMod;
+      // 统一使用取模后的 flag，避免 outer*stages 增大后 wait/set 永远匹配不上导致死锁。
+      //
+      // 约定：
+      // - stage 0/1：等待本次迭代 flagIdMod（由 init 或 stage0 set 提供）
+      // - stage >=2：等待 flagIdNextMod（由前一 stage 的 set 提供，形成跨外层迭代叠加）
+      // - stage 0：set flagIdMod
+      // - stage >0：set flagIdNextMod
+      Value waitFlagId = (stageIdx_ <= 1) ? flagIdMod : flagIdNextMod;
+      Value setFlagId = (stageIdx_ == 0) ? flagIdMod : flagIdNextMod;
 
       // 插入同步等待操作: 等待前一个stage完成
       buildCVSyncWait(builder, loc, waitCoreType, waitFlagId);
@@ -763,9 +779,8 @@ private:
   ///   for j = 0 to num_stages:
   ///     sync_block_set[initCoreType](j)
   ///
-  /// Clear循环: 在主循环后等待最后的操作完成
-  ///   for j = 0 to num_stages:
-  ///     sync_block_wait[clearCoreType]((newUpper - 1) * num_stages + j)
+  /// Clear：主循环后单次 wait，对应最后一轮外层迭代、最后一级 stage 的 set 所用 flag
+  ///（末级 stage>0 使用 flag_id + num_stages，线性下标为 newUpper*numStages + numStages - 1）。
   void insertInitAndClear(scf::ForOp outerFor, int32_t numStages,
                           hivm::TCoreType beginCoreType,
                           hivm::TCoreType endCoreType,
@@ -810,10 +825,15 @@ private:
     // 最后一个 stage 会 set 自己的 coreType 的 flag，因此这里等待 endCoreType。
     hivm::TCoreType clearCoreType = endCoreType;
 
-    // 创建Clear循环
+    if (std::optional<int64_t> trip = getConstantIntValue(newUpperBound);
+        trip && *trip <= 0) {
+      // 外层 trip 为 0 时不插入会永久阻塞的 clear
+      return;
+    }
+
+    // 单次迭代的 scf.for（0 到 1 step 1），便于挂上 hivm.tcore_type，与 InsertCVSync 习惯一致
     builder.setInsertionPointAfter(outerFor);
-    auto clearForOp =
-        builder.create<scf::ForOp>(loc, c0, cNumStages, c1);
+    auto clearForOp = builder.create<scf::ForOp>(loc, c0, c1, c1);
     auto clearCoreTypeAttr =
         mlir::hivm::TCoreTypeAttr::get(builder.getContext(), clearCoreType);
     clearForOp->setAttr(hivm::TCoreTypeAttr::name, clearCoreTypeAttr);
@@ -822,23 +842,31 @@ private:
       Block *clearBody = clearForOp.getBody();
       builder.setInsertionPointToStart(clearBody);
 
-      // token 方案下，最后一个 stage(stage=numStages-1) 会 set：
-      //   base = lastOuter*numStages + (numStages-1)
-      //   set = base + 1 = (lastOuter+1)*numStages + 0 = newUpperBound*numStages
-      // 因此 clear 只需要等待 finalToken = newUpperBound*numStages（再取模）。
-      (void)clearForOp.getInductionVar();
-
       Value numStagesI64 = builder.create<arith::ConstantOp>(
           loc, builder.getI64Type(), builder.getI64IntegerAttr(numStages));
-
-      Value outerPlusOneI64 = convertToI64(builder, loc, newUpperBound);
-      Value finalTokenI64 =
-          builder.create<arith::MulIOp>(loc, outerPlusOneI64, numStagesI64);
+      Value newUpperI64 = convertToI64(builder, loc, newUpperBound);
+      Value prod =
+          builder.create<arith::MulIOp>(loc, newUpperI64, numStagesI64);
+      Value oneI64 = builder.create<arith::ConstantOp>(
+          loc, builder.getI64Type(), builder.getI64IntegerAttr(1));
+      // 末级 stage 的 set：stage==0 用 flagId；stage>0 用 flagId+numStages。
+      // last outer = newUpper-1、last inner = numStages-1 时：
+      // - numStages==1：仅 stage0 → lastLinear = newUpper*S - 1
+      // - numStages>1：末级 stage>0 → lastLinear = newUpper*S + S - 1
+      Value lastLinear;
+      if (numStages > 1) {
+        Value withStage =
+            builder.create<arith::AddIOp>(loc, prod, numStagesI64);
+        lastLinear =
+            builder.create<arith::SubIOp>(loc, withStage, oneI64);
+      } else {
+        lastLinear = builder.create<arith::SubIOp>(loc, prod, oneI64);
+      }
 
       Value syncLimitI64 = builder.create<arith::ConstantOp>(
           loc, builder.getI64Type(), builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
       Value flagIdMod =
-          builder.create<arith::RemSIOp>(loc, finalTokenI64, syncLimitI64);
+          builder.create<arith::RemSIOp>(loc, lastLinear, syncLimitI64);
 
       buildCVSyncWait(builder, clearForOp->getLoc(), clearCoreType, flagIdMod);
     }
@@ -848,8 +876,62 @@ private:
   SmallVector<Value> workspaceValues_;
 };
 
-/// Pass入口: TileLangIREnableSoftPipeline
 namespace {
+
+/// 静态核对：对每个 flag 下标（对 SYNC_FLAGS_LIMIT 取模），constant 的
+/// sync_block_set / sync_block_wait 次数是否一致。仅统计 flag 为 arith.constant 的 op；
+/// 非常量 flag 记一次 warning 并跳过，不判失败。
+static LogicalResult verifySoftPipelineCvSync(ModuleOp module) {
+  std::array<int64_t, SYNC_FLAGS_LIMIT> setCnt{};
+  std::array<int64_t, SYNC_FLAGS_LIMIT> waitCnt{};
+  int64_t skippedNonConst = 0;
+
+  module.walk([&](Operation *op) {
+    if (!isa<hivm::SyncBlockSetOp>(op) && !isa<hivm::SyncBlockWaitOp>(op))
+      return;
+
+    if (op->getNumOperands() < 1) {
+      skippedNonConst++;
+      return;
+    }
+    Value flagVal = op->getOperand(0);
+    std::optional<int64_t> cst = getConstantIntValue(flagVal);
+    if (!cst) {
+      skippedNonConst++;
+      return;
+    }
+
+    int64_t lim = static_cast<int64_t>(SYNC_FLAGS_LIMIT);
+    int64_t mod = *cst % lim;
+    if (mod < 0)
+      mod += lim;
+    auto idx = static_cast<size_t>(mod);
+
+    if (isa<hivm::SyncBlockSetOp>(op))
+      setCnt[idx]++;
+    else
+      waitCnt[idx]++;
+  });
+
+  bool mismatch = false;
+  for (size_t i = 0; i < SYNC_FLAGS_LIMIT; ++i) {
+    if (setCnt[i] == waitCnt[i])
+      continue;
+    module.emitError()
+        << "enable-soft-pipeline verify: flag%16==" << i
+        << " has sync_block_set=" << setCnt[i] << " vs sync_block_wait="
+        << waitCnt[i] << " (constant flags only)";
+    mismatch = true;
+  }
+
+  if (skippedNonConst)
+    module.emitWarning() << "enable-soft-pipeline verify: skipped "
+                         << skippedNonConst
+                         << " sync op(s) with non-constant flag SSA";
+
+  return mismatch ? failure() : success();
+}
+
 struct TileLangIREnableSoftPipeline
     : public impl::TileLangIREnableSoftPipelineBase<
           TileLangIREnableSoftPipeline> {
@@ -935,6 +1017,11 @@ void TileLangIREnableSoftPipeline::runOnOperation() {
       SoftPipelineProcessor processor(forOp, expandedWorkspaces);
       processor.process();
     }
+  }
+
+  if (verifySoftPipelineSync) {
+    if (failed(verifySoftPipelineCvSync(module)))
+      signalPassFailure();
   }
 }
 

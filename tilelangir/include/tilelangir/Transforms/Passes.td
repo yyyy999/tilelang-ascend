@@ -157,6 +157,12 @@ def TileLangIREnableSoftPipeline : Pass<"tilelangir-enable-soft-pipeline", "::ml
     5. Computes flag IDs as outerIV * num_stages + innerIV with modulo.
     6. Inserts init/clear synchronization loops around the outer loop.
   }];
+  let options = [
+    Option<"verifySoftPipelineSync", "verify-soft-pipeline-sync", "bool",
+           /*default=*/"false",
+           "After the pass, verify that sync_block_set and sync_block_wait "
+           "counts match per flag index (constant SSA flags only; modulo 16).">,
+  ];
 }
 
 def TileLangIREnableLocalBuffer : Pass<"tilelangir-enable-local-buffer", "::mlir::ModuleOp"> {
