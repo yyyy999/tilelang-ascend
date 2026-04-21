@@ -603,12 +603,33 @@ public:
 
     if (changed) {
       insertInitAndClear(pipelineLoop_, numStages, beginCoreType, endCoreType);
+      stripLocalAllocMultiBuffer(pipelineLoop_);
     }
 
     return changed;
   }
 
 private:
+  /// In soft-pipeline mode all stages execute sequentially within each outer
+  /// iteration, so local (UB) allocs do NOT need multi-buffering.  If we
+  /// leave the `annotation.mark {hivm.multi_buffer}` in place, the later
+  /// EnableLocalBuffer pass will expand the alloc and index it by innerIV
+  /// (= stage index), which causes cross-stage buffers (produced by one
+  /// stage, consumed by another) to read from the wrong slot.
+  /// Stripping the annotation keeps the alloc shared across all stages.
+  void stripLocalAllocMultiBuffer(scf::ForOp outerFor) {
+    SmallVector<annotation::MarkOp> toErase;
+    outerFor.walk([&](annotation::MarkOp markOp) {
+      if (!markOp->hasAttr("hivm.multi_buffer"))
+        return;
+      Value marked = markOp.getOperand(0);
+      if (marked.getDefiningOp<memref::AllocOp>())
+        toErase.push_back(markOp);
+    });
+    for (auto markOp : toErase)
+      markOp->erase();
+  }
+
   /// Init: set VEC(L-1) so that (outer=0, inner=0) wait VEC(t-1 = -1 mod L)
   /// can proceed.  Runs on anotherCoreType(beginCoreType).
   /// Clear: cross-core wait for the last stage's flag = (N*S - 1) % L.
