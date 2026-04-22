@@ -9,8 +9,13 @@
  * operations from different stages can overlap execution.
  *
  * Instead of creating separate inner loops for each scope (unroll mode),
- * this pass creates a single inner loop with scf.if dispatch, enabling
- * cross-stage CV overlap through embedded synchronization.
+ * this pass creates a single inner loop with scf.if dispatch.  Each
+ * (outerIV, innerIV) pair is assigned a global timestamp t = outerIV * S +
+ * innerIV.  The stage at time t waits on the other core's flag(t-1) and
+ * sets its own core's flag(t), forming a single linear synchronization
+ * chain.  After SplitMixKernel, AIC keeps CUBE stages and AIV keeps
+ * VECTOR stages; both cores run concurrently, overlapping on different
+ * tiles through multi-buffered workspace indexed by outerIV % S.
  */
 
 #include "tilelangir/Transforms/Passes.h"
@@ -253,20 +258,36 @@ public:
 
     builder.setInsertionPoint(innerBody, innerBody->begin());
 
-    // ---- sync flag: slot-based scheme for pipeline overlap ----
-    // All stages within one outer iteration share the same flag value
-    // (= outerIV % num_stages).  This allows different outer iterations
-    // to overlap on CUBE vs VECTOR, because they use different flag slots.
-    // Intra-iteration ordering is enforced by the alternating wait/set:
-    //   stage 0 (CUBE): wait VEC(slot) → compute → set CUBE(slot)
-    //   stage 1 (VEC):  wait CUBE(slot) → compute → set VEC(slot)
-    //   stage 2 (CUBE): wait VEC(slot) → compute → set CUBE(slot)
-    //   stage 3 (VEC):  wait CUBE(slot) → compute → set VEC(slot)
     // ---- workspace buffer slot = outerIV % num_stages ----
     slotI32_ = builder.create<arith::RemSIOp>(loc, outerIV, cNumStages);
     slotIdx_ = builder.create<arith::IndexCastOp>(
         loc, builder.getIndexType(), slotI32_);
-    Value flagSlotI64 = convertToI64(builder, loc, slotI32_);
+
+    // ---- sync flag: linear chain t = outerIV * numStages + innerIV ----
+    // Each (outer, inner) pair gets a unique timestamp t.
+    // Stage at time t: wait otherCore(flag(t-1)), compute, set thisCore(flag(t)).
+    // After SplitMixKernel, AIC keeps CUBE stages, AIV keeps VECTOR stages;
+    // both cores run in parallel, synchronized only by the flag chain.
+    Value outerI64 = convertToI64(builder, loc, outerIV);
+    Value innerI64 = convertToI64(builder, loc, innerIV);
+    Value numStagesI64 = builder.create<arith::ConstantOp>(
+        loc, builder.getI64Type(), builder.getI64IntegerAttr(numStages_));
+    Value syncLimitI64 = builder.create<arith::ConstantOp>(
+        loc, builder.getI64Type(),
+        builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
+    Value oneI64 = builder.create<arith::ConstantOp>(
+        loc, builder.getI64Type(), builder.getI64IntegerAttr(1));
+    Value tI64 = builder.create<arith::AddIOp>(
+        loc,
+        builder.create<arith::MulIOp>(loc, outerI64, numStagesI64),
+        innerI64);
+    Value flagT = builder.create<arith::RemSIOp>(loc, tI64, syncLimitI64);
+    Value tMinus1PlusL = builder.create<arith::AddIOp>(
+        loc,
+        builder.create<arith::SubIOp>(loc, tI64, oneI64),
+        syncLimitI64);
+    Value flagTm1 = builder.create<arith::RemSIOp>(
+        loc, tMinus1PlusL, syncLimitI64);
 
     innerFor_ = innerFor;
 
@@ -292,7 +313,7 @@ public:
       builder.setInsertionPointToStart(thenBlock);
 
       hivm::TCoreType waitCoreType = anotherCoreType(coreType);
-      buildCVSyncWait(builder, loc, waitCoreType, flagSlotI64);
+      buildCVSyncWait(builder, loc, waitCoreType, flagTm1);
 
       Region *scopeRegion = &scopeOp.getRegion();
       if (!scopeRegion->empty()) {
@@ -311,7 +332,7 @@ public:
       adjustOperationsInBranch(thenBlock, builder);
 
       builder.setInsertionPoint(thenBlock->getTerminator());
-      buildCVSyncSet(builder, loc, coreType, flagSlotI64);
+      buildCVSyncSet(builder, loc, coreType, flagT);
     }
 
     for (auto scopeOp : scopeOps_) {
@@ -580,8 +601,10 @@ public:
     if (lastCoreTypeAttr)
       endCoreType = lastCoreTypeAttr.getTcoretype();
 
-    // Outer upperBound stays unchanged: each outer iteration runs all stages
-    // for one original iteration.
+    // Outer upperBound stays unchanged: each outer iteration processes one
+    // original tile through all stages.  CV overlap comes from the two
+    // physical cores (AIC/AIV) running different stages concurrently,
+    // synchronized by the linear flag chain.
     SoftPipelineConverter converter(pipelineLoop_, scopeOps, workspaceValues_,
                                     numStages);
     bool changed = converter.convert();
@@ -615,11 +638,15 @@ private:
       markOp->erase();
   }
 
-  /// Init: set VEC(0..S-1) so the first S outer iterations' stage-0 can
-  /// proceed without waiting.  Runs on anotherCoreType(beginCoreType).
-  /// Clear: wait VEC(0..S-1) to drain the pipeline.  Runs on
-  /// anotherCoreType(endCoreType) so that after SplitMixKernel the "fast"
-  /// core blocks before proceeding past the pipeline.
+  /// Init: set a single flag so (outer=0, inner=0) can pass its wait.
+  /// The first stage waits on flag(t-1) = flag(-1+L) = flag(L-1),
+  /// so we pre-set anotherCoreType(beginCoreType) on flag L-1.
+  /// Wrapped in a single-trip for loop with hivm.tcore_type so that
+  /// SplitMixKernel keeps it only in the correct function.
+  ///
+  /// Clear: wait on the last flag produced by the pipeline.
+  /// The last stage sets endCoreType on flag((N*S-1) % L).
+  /// The opposite core must wait on that flag before proceeding.
   void insertInitAndClear(scf::ForOp outerFor, int32_t numStages,
                           hivm::TCoreType beginCoreType,
                           hivm::TCoreType endCoreType) {
@@ -629,59 +656,56 @@ private:
     OpBuilder builder(outerFor);
     Location loc = outerFor->getLoc();
 
-    builder.setInsertionPoint(outerFor);
-
-    // --- Init: set VEC(0), VEC(1), ..., VEC(S-1) ---
-    // Pre-fill S flags so the first S outer iterations' stage-0 can proceed
-    // without waiting.  This is analogous to InsertCVSync's init loop.
-    hivm::TCoreType initCoreType = anotherCoreType(beginCoreType);
-
     Value c0 = builder.create<arith::ConstantOp>(
         loc, builder.getI32Type(), builder.getI32IntegerAttr(0));
     Value c1 = builder.create<arith::ConstantOp>(
         loc, builder.getI32Type(), builder.getI32IntegerAttr(1));
-    Value cNumStagesI32 = builder.create<arith::ConstantOp>(
-        loc, builder.getI32Type(), builder.getI32IntegerAttr(numStages));
 
-    auto initForOp = builder.create<scf::ForOp>(loc, c0, cNumStagesI32, c1);
-    auto initCoreTypeAttr =
-        mlir::hivm::TCoreTypeAttr::get(builder.getContext(), initCoreType);
-    initForOp->setAttr(hivm::TCoreTypeAttr::name, initCoreTypeAttr);
+    // --- Init: single set on flag = SYNC_FLAGS_LIMIT - 1 ---
+    hivm::TCoreType initCoreType = anotherCoreType(beginCoreType);
+    builder.setInsertionPoint(outerFor);
+
+    auto initForOp = builder.create<scf::ForOp>(loc, c0, c1, c1);
+    initForOp->setAttr(hivm::TCoreTypeAttr::name,
+        mlir::hivm::TCoreTypeAttr::get(builder.getContext(), initCoreType));
     {
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(initForOp.getBody());
-      Value initIV = initForOp.getInductionVar();
-      Value initFlagI64 = convertToI64(builder, loc, initIV);
+      Value initFlagI64 = builder.create<arith::ConstantOp>(
+          loc, builder.getI64Type(),
+          builder.getI64IntegerAttr(
+              static_cast<int64_t>(SYNC_FLAGS_LIMIT) - 1));
       buildCVSyncSet(builder, loc, initCoreType, initFlagI64);
     }
 
-    // --- Clear: cross-core wait for last flag ---
-    // The clear loop runs on the OPPOSITE core of the last stage so that
-    // after SplitMixKernel the "fast" core cannot race ahead to the next
-    // outer iteration and steal the flag that the "slow" core still needs.
-    // The wait itself targets endCoreType's flag (cross-core barrier).
-    hivm::TCoreType clearLoopCoreType = anotherCoreType(endCoreType);
+    // --- Clear: single wait on flag = (N * numStages - 1) % L ---
     Value upperBound = outerFor.getUpperBound();
-
     if (std::optional<int64_t> trip = getConstantIntValue(upperBound);
         trip && *trip <= 0) {
       return;
     }
 
-    // --- Clear: wait VEC(0), VEC(1), ..., VEC(S-1) ---
-    // Drain the remaining flag from each slot so that:
-    // (a) the "fast" core cannot race ahead to reuse the outer loop, and
-    // (b) flags are balanced (net zero) for a potential next invocation.
+    hivm::TCoreType clearCoreType = anotherCoreType(endCoreType);
     builder.setInsertionPointAfter(outerFor);
-    auto clearForOp = builder.create<scf::ForOp>(loc, c0, cNumStagesI32, c1);
-    auto clearCoreTypeAttr =
-        mlir::hivm::TCoreTypeAttr::get(builder.getContext(), clearLoopCoreType);
-    clearForOp->setAttr(hivm::TCoreTypeAttr::name, clearCoreTypeAttr);
+
+    auto clearForOp = builder.create<scf::ForOp>(loc, c0, c1, c1);
+    clearForOp->setAttr(hivm::TCoreTypeAttr::name,
+        mlir::hivm::TCoreTypeAttr::get(builder.getContext(), clearCoreType));
     {
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(clearForOp.getBody());
-      Value clearIV = clearForOp.getInductionVar();
-      Value clearFlagI64 = convertToI64(builder, loc, clearIV);
+      Value nI64 = convertToI64(builder, loc, upperBound);
+      Value numStagesI64 = builder.create<arith::ConstantOp>(
+          loc, builder.getI64Type(), builder.getI64IntegerAttr(numStages));
+      Value syncLimitI64 = builder.create<arith::ConstantOp>(
+          loc, builder.getI64Type(),
+          builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
+      Value oneI64 = builder.create<arith::ConstantOp>(
+          loc, builder.getI64Type(), builder.getI64IntegerAttr(1));
+      Value nTimesS = builder.create<arith::MulIOp>(loc, nI64, numStagesI64);
+      Value lastT = builder.create<arith::SubIOp>(loc, nTimesS, oneI64);
+      Value clearFlagI64 =
+          builder.create<arith::RemSIOp>(loc, lastT, syncLimitI64);
       buildCVSyncWait(builder, loc, endCoreType, clearFlagI64);
     }
   }
