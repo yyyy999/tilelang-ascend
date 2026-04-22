@@ -8,14 +8,14 @@
  * Transforms pipelined loops into soft-pipeline mode where Cube and Vector
  * operations from different stages can overlap execution.
  *
- * Instead of creating separate inner loops for each scope (unroll mode),
- * this pass creates a single inner loop with scf.if dispatch.  Each
- * (outerIV, innerIV) pair is assigned a global timestamp t = outerIV * S +
- * innerIV.  The stage at time t waits on the other core's flag(t-1) and
- * sets its own core's flag(t), forming a single linear synchronization
- * chain.  After SplitMixKernel, AIC keeps CUBE stages and AIV keeps
- * VECTOR stages; both cores run concurrently, overlapping on different
- * tiles through multi-buffered workspace indexed by outerIV % S.
+ * When preconditions for two-branch software pipelining are met
+ * (num_stages==2, even scope count, flag budget), the pass replaces the
+ * inner stage loop with two parallel `scf.if` regions: "front" stages for
+ * tile k and "back" stages for tile (k-1) in the same outer iteration, with
+ * workspace slot = tile % S.  Per-workspace CV sync is inserted around
+ * `memref.copy` to/from the expanded workspace.  Otherwise, the pass falls
+ * back to a single inner `scf.for` over stages and a linear timestamp flag
+ * chain (t = outerIV * S + innerIV) as in the original implementation.
  */
 
 #include "tilelangir/Transforms/Passes.h"
@@ -119,6 +119,35 @@ static hivm::TCoreType anotherCoreType(const hivm::TCoreType &current) {
                                             : hivm::TCoreType::VECTOR;
 }
 
+/// sync_block_set: [core, src_pipe, PIPE_S, flag, ...]
+static void
+buildHivmSyncSet(OpBuilder &builder, Location loc, hivm::TCoreType core,
+                 hivm::PIPE srcPipe, Value flagId) {
+  auto coreAttr = hivm::TCoreTypeAttr::get(builder.getContext(), core);
+  auto syncMode = hivm::SyncBlockInstrModeAttr::get(
+      builder.getContext(),
+      hivm::SyncBlockInstrMode::INTRA_BLOCK_SYNCHRONIZATION);
+  auto pipeS =
+      hivm::PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_S);
+  auto srcPipeAttr = hivm::PipeAttr::get(builder.getContext(), srcPipe);
+
+  builder.create<hivm::SyncBlockSetOp>(loc, coreAttr, srcPipeAttr, pipeS,
+                                       flagId, Value(), syncMode);
+}
+
+/// sync_block_wait: [core, PIPE_S, dst_pipe, flag]
+static void
+buildHivmSyncWait(OpBuilder &builder, Location loc, hivm::TCoreType core,
+                 hivm::PIPE dstPipe, Value flagId) {
+  auto coreAttr = hivm::TCoreTypeAttr::get(builder.getContext(), core);
+  auto pipeS =
+      hivm::PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_S);
+  auto dstPipeAttr = hivm::PipeAttr::get(builder.getContext(), dstPipe);
+
+  builder.create<hivm::SyncBlockWaitOp>(loc, coreAttr, pipeS, dstPipeAttr,
+                                        flagId);
+}
+
 static void buildCVSyncSet(OpBuilder &builder, Location loc,
                            hivm::TCoreType coreSrc, Value flagId) {
   auto coreSrcAttr =
@@ -140,15 +169,38 @@ static void buildCVSyncSet(OpBuilder &builder, Location loc,
 
 static void buildCVSyncWait(OpBuilder &builder, Location loc,
                             hivm::TCoreType coreSrc, Value flagId) {
-  auto coreSrcAttr =
-      mlir::hivm::TCoreTypeAttr::get(builder.getContext(), coreSrc);
-  auto tPipTypeAttr =
-      hivm::PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_S);
-  auto pipTypeAttr =
-      hivm::PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_MTE2);
+  buildHivmSyncWait(builder, loc, coreSrc, hivm::PIPE::PIPE_MTE2, flagId);
+}
 
-  builder.create<hivm::SyncBlockWaitOp>(loc, coreSrcAttr, tPipTypeAttr,
-                                        pipTypeAttr, flagId);
+static std::pair<Value, Value> buildLinearFlagsFromT(OpBuilder &builder,
+                                                     Location loc,
+                                                     Value tI64) {
+  Value syncLimitI64 = builder.create<arith::ConstantOp>(
+      loc, builder.getI64Type(),
+      builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
+  Value oneI64 = builder.create<arith::ConstantOp>(
+      loc, builder.getI64Type(), builder.getI64IntegerAttr(1));
+  Value flagT = builder.create<arith::RemSIOp>(loc, tI64, syncLimitI64);
+  Value tMinus1PlusL = builder.create<arith::AddIOp>(
+      loc, builder.create<arith::SubIOp>(loc, tI64, oneI64), syncLimitI64);
+  Value flagTm1 = builder.create<arith::RemSIOp>(loc, tMinus1PlusL, syncLimitI64);
+  return {flagTm1, flagT};
+}
+
+/// First expanded workspace with static leading dim == 2 (S=2, B=1 two-branch).
+static std::optional<int32_t> getTwoBranchWorkspaceSlotS(
+    ArrayRef<Value> workspaceValues) {
+  for (Value ws : workspaceValues) {
+    auto ty = ws.getType().dyn_cast<MemRefType>();
+    if (!ty || ty.getRank() < 1)
+      continue;
+    if (ty.isDynamicDim(0))
+      return std::nullopt;
+    int64_t d0 = ty.getDimSize(0);
+    if (d0 == 2)
+      return 2;
+  }
+  return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,12 +280,191 @@ public:
   bool convert() {
     if (scopeOps_.empty())
       return false;
+    if (canUseTwoBranch())
+      return convertTwoBranch();
+    return convertWithInnerLoop();
+  }
+
+private:
+  bool canUseTwoBranch() const {
+    if (scopeOps_.size() < 2 || (scopeOps_.size() & 1))
+      return false;
+    if (static_cast<int32_t>(scopeOps_.size()) != numStages_)
+      return false;
+    if (!getTwoBranchWorkspaceSlotS(workspaceValues_).has_value())
+      return false;
+    return true;
+  }
+
+  static void moveScopeBodyBeforeTerminator(scope::ScopeOp scope,
+                                            Block *dest) {
+    if (scope.getRegion().empty())
+      return;
+    Block *scopeBody = &scope.getRegion().front();
+    SmallVector<Operation *> ops;
+    for (Operation &op : scopeBody->getOperations()) {
+      if (!isa<scope::ReturnOp>(op))
+        ops.push_back(&op);
+    }
+    for (Operation *op : ops)
+      op->moveBefore(dest->getTerminator());
+  }
+
+  static void
+  replaceInductionInBlockExcludingDef(Block *block, Value from, Value to,
+                                      Operation *excludedUser) {
+    if (!from || !to)
+      return;
+    from.replaceUsesWithIf(to, [&](OpOperand &u) {
+      Operation *user = u.getOwner();
+      if (user->getBlock() != block)
+        return false;
+      if (user == excludedUser)
+        return false;
+      return u.get() == from;
+    });
+  }
+
+  static Value createIntLikeConstant(OpBuilder &builder, Location loc,
+                                        Type t, int64_t v) {
+    if (t.isIndex())
+      return builder.create<arith::ConstantIndexOp>(loc, v);
+    return builder.create<arith::ConstantOp>(loc, t,
+                                            builder.getIntegerAttr(t, v));
+  }
+
+  /// Software pipeline: two parallel scf.if (tile k "front" / tile k-1 "back"),
+  /// no inner stage loop.  Upper bound = N+1, slot = tile % S.  Requires
+  /// static 2-wide workspace, scope count == num_stages_.
+  bool convertTwoBranch() {
+    int32_t half = static_cast<int32_t>(scopeOps_.size() / 2);
 
     OpBuilder builder(outerFor_);
     Location loc = outerFor_.getLoc();
     Value outerIV = outerFor_.getInductionVar();
+    auto ivType = outerIV.getType();
+    if (!ivType.isIntOrIndex())
+      return false;
+    std::optional<int32_t> slotSOpt = getTwoBranchWorkspaceSlotS(workspaceValues_);
+    if (!slotSOpt)
+      return false; // canUseTwoBranch and workspace shape diverged
+    int32_t slotS = *slotSOpt;
 
-    // innerFor insertion: before the first ScopeOp to preserve dominance
+    Value originalUB = outerFor_.getUpperBound();
+    Value c1 = createIntLikeConstant(builder, loc, ivType, 1);
+    Value c0 = createIntLikeConstant(builder, loc, ivType, 0);
+    Value cSlot = createIntLikeConstant(builder, loc, ivType, slotS);
+
+    Value newUB = builder.create<arith::AddIOp>(loc, originalUB, c1);
+    outerFor_.setUpperBound(newUB);
+    outerFor_->setAttr("hivm.soft_pipeline", builder.getUnitAttr());
+
+    if (scopeOps_.empty() || scopeOps_.front()->getBlock() != outerFor_.getBody())
+      builder.setInsertionPointToStart(outerFor_.getBody());
+    else
+      builder.setInsertionPoint(scopeOps_.front());
+
+    Value numStagesI64 = builder.create<arith::ConstantOp>(
+        loc, builder.getI64Type(), builder.getI64IntegerAttr(numStages_));
+
+    // Branch 1: if k < N
+    Value cond1 = builder.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::slt, outerIV, originalUB);
+    auto ifB1 = builder.create<scf::IfOp>(loc, cond1, false);
+    Block *then1 = &ifB1.getThenRegion().front();
+    builder.setInsertionPointToStart(then1);
+    Value slotI32B1 = builder.create<arith::RemSIOp>(loc, outerIV, cSlot);
+    Value slotIdxB1 = slotI32B1.getType().isIndex()
+                        ? slotI32B1
+                        : builder.create<arith::IndexCastOp>(
+                              loc, builder.getIndexType(), slotI32B1);
+
+    for (int s = 0; s < half; ++s) {
+      scope::ScopeOp scopeOp = scopeOps_[s];
+      auto coreTypeAttr = scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(
+          hivm::TCoreTypeAttr::name);
+      if (!coreTypeAttr) {
+        scopeOp->emitWarning("ScopeOp without tcore_type, skipping");
+        continue;
+      }
+      hivm::TCoreType coreType = coreTypeAttr.getTcoretype();
+      hivm::TCoreType waitCoreType = anotherCoreType(coreType);
+
+      Value outerI64 = convertToI64(builder, loc, outerIV);
+      Value stageI64 = builder.create<arith::ConstantOp>(
+          loc, builder.getI64Type(), builder.getI64IntegerAttr(s));
+      Value tI64 = builder.create<arith::AddIOp>(
+          loc, builder.create<arith::MulIOp>(loc, outerI64, numStagesI64), stageI64);
+      auto [flagTm1, flagT] = buildLinearFlagsFromT(builder, loc, tI64);
+
+      builder.setInsertionPoint(then1->getTerminator());
+      buildCVSyncWait(builder, loc, waitCoreType, flagTm1);
+      moveScopeBodyBeforeTerminator(scopeOp, then1);
+      builder.setInsertionPoint(then1->getTerminator());
+      buildCVSyncSet(builder, loc, coreType, flagT);
+    }
+    adjustOperationsInBranch(then1, builder, slotIdxB1);
+
+    // Branch 2: if k > 0
+    if (scopeOps_.size() > size_t(half) &&
+        scopeOps_[half]->getBlock() == outerFor_.getBody())
+      builder.setInsertionPoint(scopeOps_[half]);
+    else
+      builder.setInsertionPointAfter(ifB1);
+
+    Value cond2 = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, outerIV, c0);
+    auto ifB2 = builder.create<scf::IfOp>(loc, cond2, false);
+    Block *then2 = &ifB2.getThenRegion().front();
+    builder.setInsertionPointToStart(then2);
+    Value kMinus1 = builder.create<arith::SubIOp>(loc, outerIV, c1).getResult();
+    Value slotI32B2 = builder.create<arith::RemSIOp>(loc, kMinus1, cSlot);
+    Value slotIdxB2 = slotI32B2.getType().isIndex()
+                        ? slotI32B2
+                        : builder.create<arith::IndexCastOp>(
+                              loc, builder.getIndexType(), slotI32B2);
+
+    for (int s = 0; s < half; ++s) {
+      scope::ScopeOp scopeOp = scopeOps_[static_cast<unsigned>(half + s)];
+      auto coreTypeAttr = scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(
+          hivm::TCoreTypeAttr::name);
+      if (!coreTypeAttr) {
+        scopeOp->emitWarning("ScopeOp without tcore_type, skipping");
+        continue;
+      }
+      hivm::TCoreType coreType = coreTypeAttr.getTcoretype();
+      hivm::TCoreType waitCoreType = anotherCoreType(coreType);
+
+      Value kMinus1I64 = convertToI64(builder, loc, kMinus1);
+      Value stageI64 = builder.create<arith::ConstantOp>(
+          loc, builder.getI64Type(), builder.getI64IntegerAttr(s + half));
+      Value tI64 = builder.create<arith::AddIOp>(
+          loc, builder.create<arith::MulIOp>(loc, kMinus1I64, numStagesI64), stageI64);
+      auto [flagTm1, flagT] = buildLinearFlagsFromT(builder, loc, tI64);
+
+      builder.setInsertionPoint(then2->getTerminator());
+      buildCVSyncWait(builder, loc, waitCoreType, flagTm1);
+      moveScopeBodyBeforeTerminator(scopeOp, then2);
+      builder.setInsertionPoint(then2->getTerminator());
+      buildCVSyncSet(builder, loc, coreType, flagT);
+    }
+    replaceInductionInBlockExcludingDef(then2, outerIV, kMinus1,
+                                        kMinus1.getDefiningOp());
+    adjustOperationsInBranch(then2, builder, slotIdxB2);
+
+    for (auto scopeOp : scopeOps_) {
+      scopeOp->erase();
+    }
+
+    innerFor_ = scf::ForOp();
+    return true;
+  }
+
+  /// Original shape: inner `scf.for` over stages and linear t = outer*S+inner.
+  bool convertWithInnerLoop() {
+    OpBuilder builder(outerFor_);
+    Location loc = outerFor_.getLoc();
+    Value outerIV = outerFor_.getInductionVar();
+
     if (!scopeOps_.empty() &&
         scopeOps_.front()->getBlock() == outerFor_.getBody()) {
       builder.setInsertionPoint(scopeOps_.front());
@@ -241,15 +472,15 @@ public:
       builder.setInsertionPointToStart(outerFor_.getBody());
     }
 
-    Value c0 = builder.create<arith::ConstantOp>(loc, builder.getI32Type(),
-                                                 builder.getI32IntegerAttr(0));
-    Value cNumStages = builder.create<arith::ConstantOp>(
-        loc, builder.getI32Type(), builder.getI32IntegerAttr(numStages_));
-    Value c1 = builder.create<arith::ConstantOp>(loc, builder.getI32Type(),
-                                                 builder.getI32IntegerAttr(1));
+    auto ivType = outerIV.getType();
+    if (!ivType.isIntOrIndex())
+      return false;
 
-    auto innerFor = builder.create<scf::ForOp>(loc, c0, cNumStages, c1,
-                                               ValueRange{});
+    Value c0 = createIntLikeConstant(builder, loc, ivType, 0);
+    Value cNumStages = createIntLikeConstant(builder, loc, ivType, numStages_);
+    Value c1 = createIntLikeConstant(builder, loc, ivType, 1);
+
+    auto innerFor = builder.create<scf::ForOp>(loc, c0, cNumStages, c1, ValueRange{});
     innerFor->setAttr("hivm.soft_pipeline", builder.getUnitAttr());
 
     Block *innerBody = innerFor.getBody();
@@ -258,16 +489,10 @@ public:
 
     builder.setInsertionPoint(innerBody, innerBody->begin());
 
-    // ---- workspace buffer slot = outerIV % num_stages ----
     slotI32_ = builder.create<arith::RemSIOp>(loc, outerIV, cNumStages);
     slotIdx_ = builder.create<arith::IndexCastOp>(
         loc, builder.getIndexType(), slotI32_);
 
-    // ---- sync flag: linear chain t = outerIV * numStages + innerIV ----
-    // Each (outer, inner) pair gets a unique timestamp t.
-    // Stage at time t: wait otherCore(flag(t-1)), compute, set thisCore(flag(t)).
-    // After SplitMixKernel, AIC keeps CUBE stages, AIV keeps VECTOR stages;
-    // both cores run in parallel, synchronized only by the flag chain.
     Value outerI64 = convertToI64(builder, loc, outerIV);
     Value innerI64 = convertToI64(builder, loc, innerIV);
     Value numStagesI64 = builder.create<arith::ConstantOp>(
@@ -278,16 +503,11 @@ public:
     Value oneI64 = builder.create<arith::ConstantOp>(
         loc, builder.getI64Type(), builder.getI64IntegerAttr(1));
     Value tI64 = builder.create<arith::AddIOp>(
-        loc,
-        builder.create<arith::MulIOp>(loc, outerI64, numStagesI64),
-        innerI64);
+        loc, builder.create<arith::MulIOp>(loc, outerI64, numStagesI64), innerI64);
     Value flagT = builder.create<arith::RemSIOp>(loc, tI64, syncLimitI64);
     Value tMinus1PlusL = builder.create<arith::AddIOp>(
-        loc,
-        builder.create<arith::SubIOp>(loc, tI64, oneI64),
-        syncLimitI64);
-    Value flagTm1 = builder.create<arith::RemSIOp>(
-        loc, tMinus1PlusL, syncLimitI64);
+        loc, builder.create<arith::SubIOp>(loc, tI64, oneI64), syncLimitI64);
+    Value flagTm1 = builder.create<arith::RemSIOp>(loc, tMinus1PlusL, syncLimitI64);
 
     innerFor_ = innerFor;
 
@@ -303,10 +523,10 @@ public:
 
       builder.setInsertionPoint(terminator);
 
-      Value cmpVal = builder.create<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::eq, innerIV,
-          builder.create<arith::ConstantOp>(loc, builder.getI32Type(),
-                                            builder.getI32IntegerAttr(stageIdx_)));
+      Value stageConst = createIntLikeConstant(builder, loc, innerIV.getType(),
+                                                static_cast<int64_t>(stageIdx_));
+      Value cmpVal = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                                 innerIV, stageConst);
 
       auto ifOp = builder.create<scf::IfOp>(loc, cmpVal, false);
       Block *thenBlock = &ifOp.getThenRegion().front();
@@ -329,7 +549,7 @@ public:
         }
       }
 
-      adjustOperationsInBranch(thenBlock, builder);
+      adjustOperationsInBranch(thenBlock, builder, slotIdx_);
 
       builder.setInsertionPoint(thenBlock->getTerminator());
       buildCVSyncSet(builder, loc, coreType, flagT);
@@ -342,7 +562,6 @@ public:
     return true;
   }
 
-private:
   static Value getViewLikeRoot(Value v) {
     while (Operation *def = v.getDefiningOp()) {
       if (auto sv = dyn_cast<memref::SubViewOp>(def)) {
@@ -368,7 +587,8 @@ private:
 
   /// Only adjust workspace subview / copy ops (add buffer-slot dimension).
   /// Global-memory subviews stay unchanged: outerIV IS the original iteration.
-  void adjustOperationsInBranch(Block *thenBlock, OpBuilder &builder) {
+  void adjustOperationsInBranch(Block *thenBlock, OpBuilder &builder,
+                                 Value slotIdx) {
     SmallVector<Operation *> opsSnapshot;
     opsSnapshot.reserve(thenBlock->getOperations().size());
     for (Operation &op : thenBlock->getOperations())
@@ -383,7 +603,7 @@ private:
       if (auto subview = dyn_cast<memref::SubViewOp>(op)) {
         if (isWorkspaceValue(subview.getSource())) {
           builder.setInsertionPoint(subview);
-          adjustWorkspaceSubview(subview, builder);
+          adjustWorkspaceSubview(subview, builder, slotIdx);
         }
         continue;
       }
@@ -392,15 +612,16 @@ private:
         if (isWorkspaceValue(copyOp.getSource()) ||
             isWorkspaceValue(copyOp.getTarget())) {
           builder.setInsertionPoint(copyOp);
-          adjustCopyOp(copyOp, builder);
+          adjustCopyOp(copyOp, builder, slotIdx);
         }
         continue;
       }
     }
   }
 
-  /// Workspace subview: prepend slotIdx_ (= outerIV % num_stages) dimension.
-  void adjustWorkspaceSubview(memref::SubViewOp subview, OpBuilder &builder) {
+  /// Workspace subview: prepend `slotIdx` (tile % S) on the buffer-slot dim.
+  void adjustWorkspaceSubview(memref::SubViewOp subview, OpBuilder &builder,
+                              Value slotIdx) {
     Location loc = subview.getLoc();
     Value source = subview.getSource();
     auto sourceType = source.getType().cast<MemRefType>();
@@ -436,9 +657,9 @@ private:
       }
     }
 
-    // Prepend buffer-slot dimension (slotIdx_ = outerIV % num_stages)
+    // Prepend buffer-slot dimension (slotIdx = effective tile % S)
     SmallVector<OpFoldResult> newOffsets, newSizes, newStrides;
-    newOffsets.push_back(slotIdx_);
+    newOffsets.push_back(slotIdx);
     newSizes.push_back(builder.getIndexAttr(1));
     newStrides.push_back(builder.getIndexAttr(1));
 
@@ -473,8 +694,8 @@ private:
     subview.erase();
   }
 
-  /// Workspace copy: slice with slotIdx_ (= outerIV % num_stages).
-  void adjustCopyOp(memref::CopyOp copyOp, OpBuilder &builder) {
+  /// Workspace copy: slice with `slotIdx` (tile % S on workspace leading dim).
+  void adjustCopyOp(memref::CopyOp copyOp, OpBuilder &builder, Value slotIdx) {
     Location loc = copyOp.getLoc();
 
     Value ws = nullptr;
@@ -497,7 +718,7 @@ private:
     auto wsType = ws.getType().cast<MemRefType>();
 
     SmallVector<OpFoldResult> offsets, sizes, strides;
-    offsets.push_back(slotIdx_);
+    offsets.push_back(slotIdx);
     sizes.push_back(builder.getIndexAttr(1));
     strides.push_back(builder.getIndexAttr(1));
 
@@ -601,10 +822,8 @@ public:
     if (lastCoreTypeAttr)
       endCoreType = lastCoreTypeAttr.getTcoretype();
 
-    // Outer upperBound stays unchanged: each outer iteration processes one
-    // original tile through all stages.  CV overlap comes from the two
-    // physical cores (AIC/AIV) running different stages concurrently,
-    // synchronized by the linear flag chain.
+    // In two-branch mode (S=2 workspace) the pass bumps upper bound to N+1;
+    // otherwise the inner stage loop and linear flag chain are unchanged.
     SoftPipelineConverter converter(pipelineLoop_, scopeOps, workspaceValues_,
                                     numStages);
     bool changed = converter.convert();
