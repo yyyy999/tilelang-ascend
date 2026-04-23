@@ -4,6 +4,11 @@
 /*!
  * \file tilelangir/lib/Transforms/SplitMixKernel.cpp
  * \brief Split mixed kernel into AIC and AIV functions.
+ *
+ * Soft-pipeline IR may place `hivm.soft_pipeline` on the outer `scf.for` and
+ * use parallel `scf.if` branches; `filterSoftPipelineIfBranches` only touches
+ * `scf.if` nested under such a for.  HIVM ops with explicit tcore (e.g. sync)
+ * are dropped on the wrong kernel via `CoreTypeInterface`.
  */
 
 #include "tilelangir/Transforms/Passes.h"
@@ -59,6 +64,18 @@ static std::optional<std::string> getMemSpaceString(MemRefType type) {
   return std::nullopt;
 }
 
+/// true if any ancestor (including immediate parent region owner) is
+/// `scf.for` with `hivm.soft_pipeline` (outer pipeline or legacy inner for).
+static bool isUnderSoftPipelineFor(Operation *op) {
+  for (Operation *p = op->getParentOp(); p; p = p->getParentOp()) {
+    if (auto forOp = dyn_cast<scf::ForOp>(p)) {
+      if (forOp->hasAttr("hivm.soft_pipeline"))
+        return true;
+    }
+  }
+  return false;
+}
+
 // 判断操作是否应该被删除（仅针对计算指令）
 static bool shouldDeleteComputationOp(Operation *op, bool isAIC) {
   // 1. 处理 scf.for 循环
@@ -77,6 +94,16 @@ static bool shouldDeleteComputationOp(Operation *op, bool isAIC) {
       return false;
     // 没有标签的循环保留
     return false;
+  }
+
+  // 1b. 按 HIVM 显式 tcore 删除（如 sync 仅含 flag 操作数、无 memref 作 space 线索）
+  if (auto ctIface = dyn_cast<CoreTypeInterface>(op)) {
+    if (auto ct = ctIface.getCoreType()) {
+      if (isAIC && *ct == TCoreType::VECTOR)
+        return true;
+      if (!isAIC && *ct == TCoreType::CUBE)
+        return true;
+    }
   }
 
   // 2. 处理具体的计算指令 (HIVM 指令等)
@@ -123,11 +150,14 @@ static bool branchContainsCoreType(Block *block, bool isAIC) {
   return false;
 }
 
-// 处理 soft pipeline 循环内的 scf.if 分支
-// AIC: 保留 CUBE 分支，清空 VECTOR 分支
-// AIV: 保留 VECTOR 分支，清空 CUBE 分支
+// 处理 *位于 soft_pipeline for 下* 的 scf.if 分支（两 branch 同迭代结构）。
+// 仅当 then 中出现了本核会保留的计算时再保留 then；否则清空（后续 DCE）。
+// AIC: 以 CUBE 相关为准；AIV: 以 VECTOR 相关为准。
+// 不处理 pipeline 外的 scf.if，避免误清 init/其它 if。
 static void filterSoftPipelineIfBranches(func::FuncOp func, bool isAIC) {
   func.walk<WalkOrder::PostOrder>([&](scf::IfOp ifOp) {
+    if (!isUnderSoftPipelineFor(ifOp.getOperation()))
+      return;
     Block *thenBlock = &ifOp.getThenRegion().front();
 
     bool shouldKeep = branchContainsCoreType(thenBlock, isAIC);
