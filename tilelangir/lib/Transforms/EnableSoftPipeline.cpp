@@ -463,7 +463,17 @@ private:
       return false; // S even, S>=2, B = S/2
     if (static_cast<int64_t>(workspaceValues_.size()) * sBuf > SYNC_FLAGS_LIMIT)
       return false; // W*S <= 16
-    return true;
+    // Two-branch mode maps the first half of scopes to tile k*B+b and the
+    // second half to tile (k-1)*B+b (see convertTwoBranch). Any UB (or other
+    // per-iteration) memref.alloc that sits in the outer loop body *before* the
+    // generated scf.if pair is still a single SSA value per iteration: the
+    // second half therefore reads the wrong memory (previous-tile state from
+    // iteration k-1 is required) and on the epilogue iteration branch1 is
+    // false while branch2 can still run, leaving buffers uninitialized. That
+    // miscompiles FlashAttention (e.g. vexp -> alloc then vmul with alloc in
+    // the back branch) and can surface on-device as illegal instruction /
+    // unaligned UUB until we add proper ping-pong or hoist carried buffers.
+    return false;
   }
 
   static void moveScopeBodyBeforeTerminator(scope::ScopeOp scope,
