@@ -239,7 +239,8 @@ static bool getFlashAttentionWaitSetWs(int32_t numStages, int32_t wCount,
     return false;
   switch (stageIdx) {
   case 0:
-    *waitWs = *setWs = 0;
+    *waitWs = 2;
+    *setWs = 0;
     return true;
   case 1:
     *waitWs = 0;
@@ -251,7 +252,7 @@ static bool getFlashAttentionWaitSetWs(int32_t numStages, int32_t wCount,
     return true;
   case 3:
     *waitWs = 1;
-    *setWs = 1;
+    *setWs = 2;
     return true;
   default:
     return false;
@@ -673,7 +674,6 @@ private:
           continue;
         }
         hivm::TCoreType coreType = coreTypeAttr.getTcoretype();
-        hivm::TCoreType waitCoreType = anotherCoreType(coreType);
 
         builder.setInsertionPoint(target->getTerminator());
         if (useParametric && sBufParam) {
@@ -681,7 +681,7 @@ private:
           if (getFlashAttentionWaitSetWs(4, 3, globalStage, &wW, &wS)) {
             Value fW = buildParametricFlagI64(builder, loc, wW, sBufForFlags, slotI32);
             Value fS = buildParametricFlagI64(builder, loc, wS, sBufForFlags, slotI32);
-            buildCVSyncWait(builder, loc, waitCoreType, fW);
+            buildCVSyncWait(builder, loc, coreType, fW);
             if (doClone) {
               IRMapping m;
               m.map(outerIV, tileV);
@@ -700,7 +700,7 @@ private:
         Value tI64 = builder.create<arith::AddIOp>(
             loc, builder.create<arith::MulIOp>(loc, tileI64, numStagesI64), stageI64);
         auto [flagTm1, flagT] = buildLinearFlagsFromT(builder, loc, tI64);
-        buildCVSyncWait(builder, loc, waitCoreType, flagTm1);
+        buildCVSyncWait(builder, loc, coreType, flagTm1);
         if (doClone) {
           IRMapping m;
           m.map(outerIV, tileV);
@@ -850,13 +850,12 @@ private:
       Block *thenBlock = &ifOp.getThenRegion().front();
       builder.setInsertionPointToStart(thenBlock);
 
-      hivm::TCoreType waitCoreType = anotherCoreType(coreType);
       int wW = 0, wS = 0;
       if (useParametric && sBufSlot &&
           getFlashAttentionWaitSetWs(4, 3, static_cast<int32_t>(stageIdx_), &wW, &wS)) {
         Value fW = buildParametricFlagI64(builder, loc, wW, sBufForFlags, slotI32_);
         Value fS = buildParametricFlagI64(builder, loc, wS, sBufForFlags, slotI32_);
-        buildCVSyncWait(builder, loc, waitCoreType, fW);
+        buildCVSyncWait(builder, loc, coreType, fW);
         Region *scopeRegion = &scopeOp.getRegion();
         if (!scopeRegion->empty()) {
           Block *scopeBody = &scopeRegion->front();
@@ -875,7 +874,7 @@ private:
         buildCVSyncSet(builder, loc, coreType, fS);
         continue;
       }
-      buildCVSyncWait(builder, loc, waitCoreType, flagTm1);
+      buildCVSyncWait(builder, loc, coreType, flagTm1);
 
       Region *scopeRegion = &scopeOp.getRegion();
       if (!scopeRegion->empty()) {
