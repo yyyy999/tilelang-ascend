@@ -312,7 +312,21 @@ static void insertParametricInitAndClearForFA(scf::ForOp outerFor, int32_t sBuf)
   Value c0I32 = i32c(0);
   Value c1I32 = i32c(1);
   int twoS = 2 * sBuf;
-  // --- AIV init: set flags [0, 2*S) (ws_qk + ws_pv) ---
+  Value aicLb = i32c(twoS);
+  Value aicUb = i32c(twoS + sBuf);
+  // --- Init loop 1 (AIC / CUBE): set ws_sm flags 2*S..2*S+S-1 (§7.4) ---
+  auto initAic = builder.create<scf::ForOp>(loc, aicLb, aicUb, c1I32);
+  initAic->setAttr(
+      hivm::TCoreTypeAttr::name,
+      hivm::TCoreTypeAttr::get(ctx, hivm::TCoreType::CUBE));
+  {
+    OpBuilder::InsertionGuard g(builder);
+    builder.setInsertionPointToStart(initAic.getBody());
+    Value i = initAic.getInductionVar();
+    Value f = convertToI64(builder, loc, i);
+    buildHivmSyncSet(builder, loc, hivm::TCoreType::CUBE, hivm::PIPE::PIPE_MTE2, f);
+  }
+  // --- Init loop 2 (AIV / VECTOR): set ws_qk+ws_pv flags 0..2*S-1 (§7.4) ---
   auto initAiv = builder.create<scf::ForOp>(loc, c0I32, i32c(twoS), c1I32);
   initAiv->setAttr(
       hivm::TCoreTypeAttr::name,
@@ -325,20 +339,6 @@ static void insertParametricInitAndClearForFA(scf::ForOp outerFor, int32_t sBuf)
     buildHivmSyncSet(builder, loc, hivm::TCoreType::VECTOR, hivm::PIPE::PIPE_MTE2,
                       f);
   }
-  // --- AIC init: set flags [2*S, 2*S+S) = ws_sm presets (§7.4) ---
-  Value aicLb = i32c(twoS);
-  Value aicUb = i32c(twoS + sBuf);
-  auto initAic = builder.create<scf::ForOp>(loc, aicLb, aicUb, c1I32);
-  initAic->setAttr(
-      hivm::TCoreTypeAttr::name,
-      hivm::TCoreTypeAttr::get(ctx, hivm::TCoreType::CUBE));
-  {
-    OpBuilder::InsertionGuard g(builder);
-    builder.setInsertionPointToStart(initAic.getBody());
-    Value i = initAic.getInductionVar();
-    Value f = convertToI64(builder, loc, i);
-    buildHivmSyncSet(builder, loc, hivm::TCoreType::CUBE, hivm::PIPE::PIPE_MTE2, f);
-  }
 
   Value upperBound = outerFor.getUpperBound();
   if (std::optional<int64_t> trip = getConstantIntValue(upperBound);
@@ -347,7 +347,7 @@ static void insertParametricInitAndClearForFA(scf::ForOp outerFor, int32_t sBuf)
   }
 
   builder.setInsertionPointAfter(outerFor);
-  // --- AIC clear: wait flags [0, 2*S) (FIX) ---
+  // --- Clear loop 1 (AIC / CUBE): wait flags [0, 2*S) (FIX) — drain qk+pv (§7.4) ---
   auto clearAic = builder.create<scf::ForOp>(loc, c0I32, i32c(twoS), c1I32);
   clearAic->setAttr(
       hivm::TCoreTypeAttr::name,
@@ -359,7 +359,7 @@ static void insertParametricInitAndClearForFA(scf::ForOp outerFor, int32_t sBuf)
     Value f = convertToI64(builder, loc, i);
     buildHivmSyncWait(builder, loc, hivm::TCoreType::CUBE, hivm::PIPE::PIPE_FIX, f);
   }
-  // --- AIV clear: wait flags [2*S, 2*S+S) (MTE3) ---
+  // --- Clear loop 2 (AIV / VECTOR): wait [2*S, 2*S+S) (MTE3) — drain ws_sm (§7.4) ---
   auto clearAiv = builder.create<scf::ForOp>(loc, aicLb, aicUb, c1I32);
   clearAiv->setAttr(
       hivm::TCoreTypeAttr::name,
@@ -1085,7 +1085,9 @@ private:
       markOp->erase();
   }
 
-  /// Init/clear: either §7.4 per-workspace (FA, W=3) or legacy linear t chain.
+  /// Init/clear: parametric path uses 2 init + 2 clear loops (AIC then AIV, §7.4);
+  /// legacy path uses 2 one-trip init (AIC/AIV) + 2 one-trip clear with the same
+  /// linear t semantics as the old single for.
   void insertInitAndClear(scf::ForOp outerFor, int32_t numStages,
                           hivm::TCoreType beginCoreType,
                           hivm::TCoreType endCoreType, bool useParametricFA,
@@ -1105,52 +1107,81 @@ private:
     Value c1 = builder.create<arith::ConstantOp>(
         loc, builder.getI32Type(), builder.getI32IntegerAttr(1));
 
-    // --- Init: single set on flag = SYNC_FLAGS_LIMIT - 1 ---
+    // --- Legacy: two one-trip init loops (AIC + AIV) so SplitMixKernel keeps
+    // sync on the right core; only the actual initCore (another of begin) sets
+    // flag = L-1.
     hivm::TCoreType initCoreType = anotherCoreType(beginCoreType);
+    Value initFlagI64 = builder.create<arith::ConstantOp>(
+        loc, builder.getI64Type(),
+        builder.getI64IntegerAttr(
+            static_cast<int64_t>(SYNC_FLAGS_LIMIT) - 1));
     builder.setInsertionPoint(outerFor);
 
-    auto initForOp = builder.create<scf::ForOp>(loc, c0, c1, c1);
-    initForOp->setAttr(hivm::TCoreTypeAttr::name,
-        mlir::hivm::TCoreTypeAttr::get(builder.getContext(), initCoreType));
+    auto initAic = builder.create<scf::ForOp>(loc, c0, c1, c1);
+    initAic->setAttr(
+        hivm::TCoreTypeAttr::name,
+        mlir::hivm::TCoreTypeAttr::get(builder.getContext(),
+                                        hivm::TCoreType::CUBE));
     {
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(initForOp.getBody());
-      Value initFlagI64 = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(
-              static_cast<int64_t>(SYNC_FLAGS_LIMIT) - 1));
-      buildCVSyncSet(builder, loc, initCoreType, initFlagI64);
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(initAic.getBody());
+      if (initCoreType == hivm::TCoreType::CUBE)
+        buildCVSyncSet(builder, loc, hivm::TCoreType::CUBE, initFlagI64);
+    }
+    auto initAiv = builder.create<scf::ForOp>(loc, c0, c1, c1);
+    initAiv->setAttr(
+        hivm::TCoreTypeAttr::name,
+        mlir::hivm::TCoreTypeAttr::get(builder.getContext(),
+                                        hivm::TCoreType::VECTOR));
+    {
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(initAiv.getBody());
+      if (initCoreType == hivm::TCoreType::VECTOR)
+        buildCVSyncSet(builder, loc, hivm::TCoreType::VECTOR, initFlagI64);
     }
 
-    // --- Clear: single wait on flag = (N * numStages - 1) % L ---
+    // --- Clear: two one-trip clear loops; same logical wait as before ---
     Value upperBound = outerFor.getUpperBound();
     if (std::optional<int64_t> trip = getConstantIntValue(upperBound);
         trip && *trip <= 0) {
       return;
     }
 
-    hivm::TCoreType clearCoreType = anotherCoreType(endCoreType);
-    builder.setInsertionPointAfter(outerFor);
+    Value nI64 = convertToI64(builder, loc, upperBound);
+    Value numStagesI64 = builder.create<arith::ConstantOp>(
+        loc, builder.getI64Type(), builder.getI64IntegerAttr(numStages));
+    Value syncLimitI64 = builder.create<arith::ConstantOp>(
+        loc, builder.getI64Type(),
+        builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
+    Value oneI64 = builder.create<arith::ConstantOp>(
+        loc, builder.getI64Type(), builder.getI64IntegerAttr(1));
+    Value nTimesS = builder.create<arith::MulIOp>(loc, nI64, numStagesI64);
+    Value lastT = builder.create<arith::SubIOp>(loc, nTimesS, oneI64);
+    Value clearFlagI64 =
+        builder.create<arith::RemSIOp>(loc, lastT, syncLimitI64);
 
-    auto clearForOp = builder.create<scf::ForOp>(loc, c0, c1, c1);
-    clearForOp->setAttr(hivm::TCoreTypeAttr::name,
-        mlir::hivm::TCoreTypeAttr::get(builder.getContext(), clearCoreType));
+    builder.setInsertionPointAfter(outerFor);
+    auto clearAic = builder.create<scf::ForOp>(loc, c0, c1, c1);
+    clearAic->setAttr(
+        hivm::TCoreTypeAttr::name,
+        mlir::hivm::TCoreTypeAttr::get(builder.getContext(),
+                                        hivm::TCoreType::CUBE));
     {
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(clearForOp.getBody());
-      Value nI64 = convertToI64(builder, loc, upperBound);
-      Value numStagesI64 = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(), builder.getI64IntegerAttr(numStages));
-      Value syncLimitI64 = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
-      Value oneI64 = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(), builder.getI64IntegerAttr(1));
-      Value nTimesS = builder.create<arith::MulIOp>(loc, nI64, numStagesI64);
-      Value lastT = builder.create<arith::SubIOp>(loc, nTimesS, oneI64);
-      Value clearFlagI64 =
-          builder.create<arith::RemSIOp>(loc, lastT, syncLimitI64);
-      buildCVSyncWait(builder, loc, endCoreType, clearFlagI64);
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(clearAic.getBody());
+      if (endCoreType == hivm::TCoreType::CUBE)
+        buildCVSyncWait(builder, loc, hivm::TCoreType::CUBE, clearFlagI64);
+    }
+    auto clearAiv = builder.create<scf::ForOp>(loc, c0, c1, c1);
+    clearAiv->setAttr(
+        hivm::TCoreTypeAttr::name,
+        mlir::hivm::TCoreTypeAttr::get(builder.getContext(),
+                                        hivm::TCoreType::VECTOR));
+    {
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(clearAiv.getBody());
+      if (endCoreType == hivm::TCoreType::VECTOR)
+        buildCVSyncWait(builder, loc, hivm::TCoreType::VECTOR, clearFlagI64);
     }
   }
 
