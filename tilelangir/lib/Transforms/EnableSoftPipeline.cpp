@@ -9,9 +9,11 @@
  * operations from different stages can overlap execution.
  *
  * When preconditions for two-branch software pipelining are met, the pass
- * replaces the inner stage loop with two parallel `scf.if` (tile k / k-1) with
- * slot = tile % S.  For Flash-Attention (4 stages, 3 workspaces) with
- * static buffer slot count S and W*S <= 16, sync flags are parametric:
+ * replaces the inner stage loop with two parallel `scf.if` (front tile k*B+b /
+ * back tile (k-1)*B+b) with slot = tile % S; when B = S/2 > 1, a per-branch
+ * `scf.for` over b in [0, B) wraps moved/cloned stage bodies.  For Flash-
+ * Attention (4 stages, 3 workspaces) with static buffer slot count S (even
+ * and W*S <= 16), sync flags are parametric:
  *   flag = workspace_index*S + (tile % S)  (§7.3), with per-stage which buffer
  *   participates in the wait and set.  Init/clear then follow §7.4.
  * Otherwise, syncs use a linear flag chain
@@ -275,24 +277,6 @@ canUseParametricWorkspaceFlags(int32_t numScopes, int32_t numStageAttr,
   return 3 * sBuf <= static_cast<int32_t>(SYNC_FLAGS_LIMIT);
 }
 
-/// First expanded workspace with static leading dim == 2 (S=2, B=1 two-branch).
-static std::optional<int32_t> getTwoBranchWorkspaceSlotS(
-    ArrayRef<Value> workspaceValues) {
-  auto s = getBufferSlotCountS(workspaceValues);
-  if (s && *s == 2)
-    return 2;
-  for (Value ws : workspaceValues) {
-    auto ty = ws.getType().dyn_cast<MemRefType>();
-    if (!ty || ty.getRank() < 1)
-      continue;
-    if (ty.isDynamicDim(0))
-      return std::nullopt;
-    if (ty.getDimSize(0) == 2)
-      return 2;
-  }
-  return std::nullopt;
-}
-
 /// Design doc §7.4: drain/preset per-buffer flags (W=3, S=shared buffer slot count).
 static void insertParametricInitAndClearForFA(scf::ForOp outerFor, int32_t sBuf) {
   if (3 * sBuf > static_cast<int32_t>(SYNC_FLAGS_LIMIT))
@@ -375,7 +359,13 @@ static void insertParametricInitAndClearForFA(scf::ForOp outerFor, int32_t sBuf)
 }
 
 // ---------------------------------------------------------------------------
-// WorkspaceExpander
+// WorkspaceExpander  (P1: intentionally **not** extended here)
+// ---------------------------------------------------------------------------
+// 扩展因子 S 只来自 `annotation::MarkOp` 的 `hivm.multi_buffer`；该属性由
+// `MarkMultiBuffer` 从前端的 `tilelangir.num_stages` 抄到各 workspace。软流水
+// 的 slot / flag 预算在 `SoftPipelineProcessor` 里按静态 memref 首维等推导，
+// **不再**在 Expand 中增加 S 的第二个来源。若 S 要变，只改 TileLang/前端
+// 与 MarkMultiBuffer，勿在本类加并行逻辑。
 // ---------------------------------------------------------------------------
 class WorkspaceExpander {
 public:
@@ -462,8 +452,14 @@ private:
       return false;
     if (static_cast<int32_t>(scopeOps_.size()) != numStages_)
       return false;
-    if (!getTwoBranchWorkspaceSlotS(workspaceValues_).has_value())
+    auto sOpt = getBufferSlotCountS(workspaceValues_);
+    if (!sOpt)
       return false;
+    int32_t sBuf = *sOpt;
+    if (sBuf < 2 || (sBuf & 1))
+      return false; // S even, S>=2, B = S/2
+    if (static_cast<int64_t>(workspaceValues_.size()) * sBuf > SYNC_FLAGS_LIMIT)
+      return false; // W*S <= 16
     return true;
   }
 
@@ -479,6 +475,22 @@ private:
     }
     for (Operation *op : ops)
       op->moveBefore(dest->getTerminator());
+  }
+
+  /// Clone a scope's body (excluding return) with \p map, inserting before
+  /// `dest`'s terminator. Used for B>1 (S=2B) so each tile iteration has its
+  /// own IR inside the per-branch mini-batch `scf.for` (§5.4 / §7.2).
+  static void cloneScopeBodyBeforeTerminator(scope::ScopeOp scope, Block *dest,
+                                             OpBuilder &builder, IRMapping &map) {
+    if (scope.getRegion().empty())
+      return;
+    Block *scopeBody = &scope.getRegion().front();
+    for (Operation &op : scopeBody->getOperations()) {
+      if (isa<scope::ReturnOp>(op))
+        continue;
+      builder.setInsertionPoint(dest->getTerminator());
+      builder.clone(op, map);
+    }
   }
 
   static void
@@ -504,9 +516,9 @@ private:
                                             builder.getIntegerAttr(t, v));
   }
 
-  /// Software pipeline: two parallel scf.if (tile k "front" / tile k-1 "back"),
-  /// no inner stage loop.  Upper bound = N+1, slot = tile % S.  Requires
-  /// static 2-wide workspace, scope count == num_stages_.
+  /// Software pipeline: two parallel scf.if (front tile / back tile) with
+  /// slot = tile % S, optional inner mini-batch (B=S/2) per §5.4 / §7.2.
+  /// Outer trip = ceil(N/B)+1; Branch1 if k*B < N, Branch2 if k>0.
   bool convertTwoBranch() {
     int32_t half = static_cast<int32_t>(scopeOps_.size() / 2);
 
@@ -516,17 +528,27 @@ private:
     auto ivType = outerIV.getType();
     if (!ivType.isIntOrIndex())
       return false;
-    std::optional<int32_t> slotSOpt = getTwoBranchWorkspaceSlotS(workspaceValues_);
-    if (!slotSOpt)
-      return false; // canUseTwoBranch and workspace shape diverged
-    int32_t slotS = *slotSOpt;
+    std::optional<int32_t> sBufO = getBufferSlotCountS(workspaceValues_);
+    if (!sBufO)
+      return false;
+    int32_t slotS = *sBufO;
+    if (slotS < 2 || (slotS & 1))
+      return false;
+    int32_t bBatch = slotS / 2; // B
+    const bool bMini = bBatch > 1;
 
     Value originalUB = outerFor_.getUpperBound();
     Value c1 = createIntLikeConstant(builder, loc, ivType, 1);
     Value c0 = createIntLikeConstant(builder, loc, ivType, 0);
+    Value cB = createIntLikeConstant(builder, loc, ivType, bBatch);
     Value cSlot = createIntLikeConstant(builder, loc, ivType, slotS);
 
-    Value newUB = builder.create<arith::AddIOp>(loc, originalUB, c1);
+    // newUB = (N + B - 1) / B + 1 = ceil(N/B) + 1; B=1 => N+1
+    Value nPlusBMinus1 =
+        builder.create<arith::AddIOp>(loc, originalUB,
+                                    builder.create<arith::SubIOp>(loc, cB, c1));
+    Value ceiledK = builder.create<arith::DivSIOp>(loc, nPlusBMinus1, cB);
+    Value newUB = builder.create<arith::AddIOp>(loc, ceiledK, c1);
     outerFor_.setUpperBound(newUB);
     outerFor_->setAttr("hivm.soft_pipeline", builder.getUnitAttr());
 
@@ -542,56 +564,101 @@ private:
     Value numStagesI64 = builder.create<arith::ConstantOp>(
         loc, builder.getI64Type(), builder.getI64IntegerAttr(numStages_));
 
-    // Branch 1: if k < N
+    // Branch1: if k * B < N
+    Value kTimesB = builder.create<arith::MulIOp>(loc, outerIV, cB);
     Value cond1 = builder.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::slt, outerIV, originalUB);
+        loc, arith::CmpIPredicate::slt, kTimesB, originalUB);
     auto ifB1 = builder.create<scf::IfOp>(loc, cond1, false);
     Block *then1 = &ifB1.getThenRegion().front();
-    builder.setInsertionPointToStart(then1);
-    Value slotI32B1 = builder.create<arith::RemSIOp>(loc, outerIV, cSlot);
-    Value slotIdxB1 = slotI32B1.getType().isIndex()
-                        ? slotI32B1
-                        : builder.create<arith::IndexCastOp>(
-                              loc, builder.getIndexType(), slotI32B1);
 
-    for (int s = 0; s < half; ++s) {
-      scope::ScopeOp scopeOp = scopeOps_[s];
-      auto coreTypeAttr = scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(
-          hivm::TCoreTypeAttr::name);
-      if (!coreTypeAttr) {
-        scopeOp->emitWarning("ScopeOp without tcore_type, skipping");
-        continue;
-      }
-      hivm::TCoreType coreType = coreTypeAttr.getTcoretype();
-      hivm::TCoreType waitCoreType = anotherCoreType(coreType);
+    auto placeSlotOpsAfter = [&](Value tileV, Block *target) {
+      if (Operation *def = tileV.getDefiningOp()) {
+        if (def->getBlock() == target)
+          builder.setInsertionPointAfter(def);
+        else
+          builder.setInsertionPointToStart(target);
+      } else
+        builder.setInsertionPointToStart(target);
+      Value s32 = builder.create<arith::RemSIOp>(loc, tileV, cSlot);
+      Value sIdx = s32.getType().isIndex()
+                     ? s32
+                     : builder.create<arith::IndexCastOp>(
+                           loc, builder.getIndexType(), s32);
+      return std::pair<Value, Value>(s32, sIdx);
+    };
 
-      builder.setInsertionPoint(then1->getTerminator());
-      if (useParametric && sBufParam) {
-        int wW, wS;
-        if (getFlashAttentionWaitSetWs(4, 3, s, &wW, &wS)) {
-          Value fW = buildParametricFlagI64(builder, loc, wW, sBufForFlags, slotI32B1);
-          Value fS = buildParametricFlagI64(builder, loc, wS, sBufForFlags, slotI32B1);
-          buildCVSyncWait(builder, loc, waitCoreType, fW);
-          moveScopeBodyBeforeTerminator(scopeOp, then1);
-          builder.setInsertionPoint(then1->getTerminator());
-          buildCVSyncSet(builder, loc, coreType, fS);
+    /// Emit the first/second "half" of scopes: tile = global tile index, sync,
+    /// then move (B=1) or clone+map(outerIV->tile) (B>1) each stage body.
+    auto emitBranchHalf = [&](Value tileV, Block *target, bool doClone,
+                              int32_t firstScopeIndex) {
+      auto [slotI32, slotIdx] = placeSlotOpsAfter(tileV, target);
+
+      for (int s = 0; s < half; ++s) {
+        int32_t globalStage = firstScopeIndex + s;
+        scope::ScopeOp scopeOp = scopeOps_[static_cast<unsigned>(globalStage)];
+        auto coreTypeAttr = scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(
+            hivm::TCoreTypeAttr::name);
+        if (!coreTypeAttr) {
+          scopeOp->emitWarning("ScopeOp without tcore_type, skipping");
           continue;
         }
-      }
-      Value outerI64 = convertToI64(builder, loc, outerIV);
-      Value stageI64 = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(), builder.getI64IntegerAttr(s));
-      Value tI64 = builder.create<arith::AddIOp>(
-          loc, builder.create<arith::MulIOp>(loc, outerI64, numStagesI64), stageI64);
-      auto [flagTm1, flagT] = buildLinearFlagsFromT(builder, loc, tI64);
-      buildCVSyncWait(builder, loc, waitCoreType, flagTm1);
-      moveScopeBodyBeforeTerminator(scopeOp, then1);
-      builder.setInsertionPoint(then1->getTerminator());
-      buildCVSyncSet(builder, loc, coreType, flagT);
-    }
-    adjustOperationsInBranch(then1, builder, slotIdxB1);
+        hivm::TCoreType coreType = coreTypeAttr.getTcoretype();
+        hivm::TCoreType waitCoreType = anotherCoreType(coreType);
 
-    // Branch 2: if k > 0
+        builder.setInsertionPoint(target->getTerminator());
+        if (useParametric && sBufParam) {
+          int wW, wS;
+          if (getFlashAttentionWaitSetWs(4, 3, globalStage, &wW, &wS)) {
+            Value fW = buildParametricFlagI64(builder, loc, wW, sBufForFlags, slotI32);
+            Value fS = buildParametricFlagI64(builder, loc, wS, sBufForFlags, slotI32);
+            buildCVSyncWait(builder, loc, waitCoreType, fW);
+            if (doClone) {
+              IRMapping m;
+              m.map(outerIV, tileV);
+              cloneScopeBodyBeforeTerminator(scopeOp, target, builder, m);
+            } else {
+              moveScopeBodyBeforeTerminator(scopeOp, target);
+            }
+            builder.setInsertionPoint(target->getTerminator());
+            buildCVSyncSet(builder, loc, coreType, fS);
+            continue;
+          }
+        }
+        Value tileI64 = convertToI64(builder, loc, tileV);
+        Value stageI64 = builder.create<arith::ConstantOp>(
+            loc, builder.getI64Type(), builder.getI64IntegerAttr(globalStage));
+        Value tI64 = builder.create<arith::AddIOp>(
+            loc, builder.create<arith::MulIOp>(loc, tileI64, numStagesI64), stageI64);
+        auto [flagTm1, flagT] = buildLinearFlagsFromT(builder, loc, tI64);
+        buildCVSyncWait(builder, loc, waitCoreType, flagTm1);
+        if (doClone) {
+          IRMapping m;
+          m.map(outerIV, tileV);
+          cloneScopeBodyBeforeTerminator(scopeOp, target, builder, m);
+        } else {
+          moveScopeBodyBeforeTerminator(scopeOp, target);
+        }
+        builder.setInsertionPoint(target->getTerminator());
+        buildCVSyncSet(builder, loc, coreType, flagT);
+      }
+      adjustOperationsInBranch(target, builder, slotIdx);
+    };
+
+    if (!bMini) {
+      builder.setInsertionPointToStart(then1);
+      emitBranchHalf(outerIV, then1, false, 0);
+    } else {
+      builder.setInsertionPointToStart(then1);
+      auto bFor1 = builder.create<scf::ForOp>(loc, c0, cB, c1);
+      Block *b1Body = bFor1.getBody();
+      builder.setInsertionPointToStart(b1Body);
+      Value t1 = builder.create<arith::AddIOp>(
+          loc, builder.create<arith::MulIOp>(loc, outerIV, cB),
+          bFor1.getInductionVar());
+      emitBranchHalf(t1, b1Body, true, 0);
+    }
+
+    // Branch2: if k > 0
     if (scopeOps_.size() > size_t(half) &&
         scopeOps_[half]->getBlock() == outerFor_.getBody())
       builder.setInsertionPoint(scopeOps_[half]);
@@ -603,51 +670,21 @@ private:
     Block *then2 = &ifB2.getThenRegion().front();
     builder.setInsertionPointToStart(then2);
     Value kMinus1 = builder.create<arith::SubIOp>(loc, outerIV, c1).getResult();
-    Value slotI32B2 = builder.create<arith::RemSIOp>(loc, kMinus1, cSlot);
-    Value slotIdxB2 = slotI32B2.getType().isIndex()
-                        ? slotI32B2
-                        : builder.create<arith::IndexCastOp>(
-                              loc, builder.getIndexType(), slotI32B2);
 
-    for (int s = 0; s < half; ++s) {
-      int globalStage = s + half;
-      scope::ScopeOp scopeOp = scopeOps_[static_cast<unsigned>(globalStage)];
-      auto coreTypeAttr = scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(
-          hivm::TCoreTypeAttr::name);
-      if (!coreTypeAttr) {
-        scopeOp->emitWarning("ScopeOp without tcore_type, skipping");
-        continue;
-      }
-      hivm::TCoreType coreType = coreTypeAttr.getTcoretype();
-      hivm::TCoreType waitCoreType = anotherCoreType(coreType);
-
-      builder.setInsertionPoint(then2->getTerminator());
-      if (useParametric && sBufParam) {
-        int wW, wS;
-        if (getFlashAttentionWaitSetWs(4, 3, globalStage, &wW, &wS)) {
-          Value fW = buildParametricFlagI64(builder, loc, wW, sBufForFlags, slotI32B2);
-          Value fS = buildParametricFlagI64(builder, loc, wS, sBufForFlags, slotI32B2);
-          buildCVSyncWait(builder, loc, waitCoreType, fW);
-          moveScopeBodyBeforeTerminator(scopeOp, then2);
-          builder.setInsertionPoint(then2->getTerminator());
-          buildCVSyncSet(builder, loc, coreType, fS);
-          continue;
-        }
-      }
-      Value kMinus1I64 = convertToI64(builder, loc, kMinus1);
-      Value stageI64 = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(), builder.getI64IntegerAttr(globalStage));
-      Value tI64 = builder.create<arith::AddIOp>(
-          loc, builder.create<arith::MulIOp>(loc, kMinus1I64, numStagesI64), stageI64);
-      auto [flagTm1, flagT] = buildLinearFlagsFromT(builder, loc, tI64);
-      buildCVSyncWait(builder, loc, waitCoreType, flagTm1);
-      moveScopeBodyBeforeTerminator(scopeOp, then2);
-      builder.setInsertionPoint(then2->getTerminator());
-      buildCVSyncSet(builder, loc, coreType, flagT);
+    if (!bMini) {
+      emitBranchHalf(kMinus1, then2, false, half);
+      replaceInductionInBlockExcludingDef(then2, outerIV, kMinus1,
+                                          kMinus1.getDefiningOp());
+    } else {
+      if (Operation *defKm = kMinus1.getDefiningOp())
+        builder.setInsertionPointAfter(defKm);
+      auto bFor2 = builder.create<scf::ForOp>(loc, c0, cB, c1);
+      Block *b2Body = bFor2.getBody();
+      builder.setInsertionPointToStart(b2Body);
+      Value t2 = builder.create<arith::AddIOp>(
+          loc, builder.create<arith::MulIOp>(loc, kMinus1, cB), bFor2.getInductionVar());
+      emitBranchHalf(t2, b2Body, true, half);
     }
-    replaceInductionInBlockExcludingDef(then2, outerIV, kMinus1,
-                                        kMinus1.getDefiningOp());
-    adjustOperationsInBranch(then2, builder, slotIdxB2);
 
     for (auto scopeOp : scopeOps_) {
       scopeOp->erase();
