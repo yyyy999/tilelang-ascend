@@ -124,7 +124,8 @@ static bool shouldDeleteComputationOp(Operation *op, bool isAIC) {
   return false;
 }
 
-// 判断 scf.if 分支内是否包含属于指定 core type 的操作
+// 判断 scf.if 分支内是否包含属于指定 core type 的操作（递归扫描嵌套 region，
+// 以支持 B>1 时 mini-batch scf.for 嵌套在 scf.if 内的结构）。
 static bool branchContainsCoreType(Block *block, bool isAIC) {
   for (Operation &op : block->getOperations()) {
     if (auto ctIface = dyn_cast<hivm::CoreTypeInterface>(&op)) {
@@ -144,6 +145,12 @@ static bool branchContainsCoreType(Block *block, bool isAIC) {
           if (!isAIC && *space == "ub")
             return true;
         }
+      }
+    }
+    for (Region &region : op.getRegions()) {
+      for (Block &nested : region) {
+        if (branchContainsCoreType(&nested, isAIC))
+          return true;
       }
     }
   }

@@ -447,10 +447,12 @@ public:
   }
 
 private:
+  /// Two-branch eligibility: scope count must be even (≥2), workspace leading
+  /// dim S must be even (≥2), and W*S ≤ 16.  S (buffer slot count) comes from
+  /// workspace shape and is independent of scopeOps_.size(); FA has 4 scopes
+  /// regardless of whether S=2 (B=1) or S=4 (B=2).
   bool canUseTwoBranch() const {
     if (scopeOps_.size() < 2 || (scopeOps_.size() & 1))
-      return false;
-    if (static_cast<int32_t>(scopeOps_.size()) != numStages_)
       return false;
     auto sOpt = getBufferSlotCountS(workspaceValues_);
     if (!sOpt)
@@ -493,6 +495,8 @@ private:
     }
   }
 
+  /// Replace `from` with `to` for all uses where the user resides in
+  /// `block` or any of its nested regions, excluding `excludedUser`.
   static void
   replaceInductionInBlockExcludingDef(Block *block, Value from, Value to,
                                       Operation *excludedUser) {
@@ -500,11 +504,15 @@ private:
       return;
     from.replaceUsesWithIf(to, [&](OpOperand &u) {
       Operation *user = u.getOwner();
-      if (user->getBlock() != block)
-        return false;
       if (user == excludedUser)
         return false;
-      return u.get() == from;
+      for (Block *b = user->getBlock(); b; b = b->getParentOp()
+                                                ? b->getParentOp()->getBlock()
+                                                : nullptr) {
+        if (b == block)
+          return u.get() == from;
+      }
+      return false;
     });
   }
 
@@ -514,6 +522,66 @@ private:
       return builder.create<arith::ConstantIndexOp>(loc, v);
     return builder.create<arith::ConstantOp>(loc, t,
                                             builder.getIntegerAttr(t, v));
+  }
+
+  /// Align \p v to \p targetTy for mixed index/int loop bounds (avoids invalid
+  /// CmpIOp / AddIOp mixes that miscompile or mis-compare tile guards).
+  static Value matchIntegerLikeType(OpBuilder &builder, Location loc, Value v,
+                                    Type targetTy) {
+    if (v.getType() == targetTy)
+      return v;
+    return builder.create<arith::IndexCastOp>(loc, targetTy, v).getResult();
+  }
+
+  /// Gather \p root and every nested block under it (nested regions).
+  static void gatherNestedBlocks(Block *root, SmallVectorImpl<Block *> &out) {
+    SmallVector<Block *> stack;
+    llvm::DenseSet<Block *> seen;
+    stack.push_back(root);
+    while (!stack.empty()) {
+      Block *b = stack.back();
+      stack.pop_back();
+      if (!seen.insert(b).second)
+        continue;
+      out.push_back(b);
+      for (Operation &op : b->getOperations())
+        for (Region &region : op.getRegions())
+          for (Block &nested : region)
+            stack.push_back(&nested);
+    }
+  }
+
+  /// Only adjust workspace subview / copy in one block (non-recursive).
+  void adjustWorkspaceOpsInSingleBlock(Block *block, OpBuilder &builder,
+                                       Value slotIdx) {
+    SmallVector<Operation *> opsSnapshot;
+    opsSnapshot.reserve(block->getOperations().size());
+    for (Operation &op : block->getOperations())
+      opsSnapshot.push_back(&op);
+
+    for (Operation *op : opsSnapshot) {
+      if (!op || op->getBlock() != block)
+        continue;
+      if (op->hasTrait<OpTrait::IsTerminator>())
+        continue;
+
+      if (auto subview = dyn_cast<memref::SubViewOp>(op)) {
+        if (isWorkspaceValue(subview.getSource())) {
+          builder.setInsertionPoint(subview);
+          adjustWorkspaceSubview(subview, builder, slotIdx);
+        }
+        continue;
+      }
+
+      if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
+        if (isWorkspaceValue(copyOp.getSource()) ||
+            isWorkspaceValue(copyOp.getTarget())) {
+          builder.setInsertionPoint(copyOp);
+          adjustCopyOp(copyOp, builder, slotIdx);
+        }
+        continue;
+      }
+    }
   }
 
   /// Software pipeline: two parallel scf.if (front tile / back tile) with
@@ -538,6 +606,8 @@ private:
     const bool bMini = bBatch > 1;
 
     Value originalUB = outerFor_.getUpperBound();
+    Value loopBound =
+        matchIntegerLikeType(builder, loc, originalUB, ivType);
     Value c1 = createIntLikeConstant(builder, loc, ivType, 1);
     Value c0 = createIntLikeConstant(builder, loc, ivType, 0);
     Value cB = createIntLikeConstant(builder, loc, ivType, bBatch);
@@ -545,7 +615,7 @@ private:
 
     // newUB = (N + B - 1) / B + 1 = ceil(N/B) + 1; B=1 => N+1
     Value nPlusBMinus1 =
-        builder.create<arith::AddIOp>(loc, originalUB,
+        builder.create<arith::AddIOp>(loc, loopBound,
                                     builder.create<arith::SubIOp>(loc, cB, c1));
     Value ceiledK = builder.create<arith::DivSIOp>(loc, nPlusBMinus1, cB);
     Value newUB = builder.create<arith::AddIOp>(loc, ceiledK, c1);
@@ -567,7 +637,7 @@ private:
     // Branch1: if k * B < N
     Value kTimesB = builder.create<arith::MulIOp>(loc, outerIV, cB);
     Value cond1 = builder.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::slt, kTimesB, originalUB);
+        loc, arith::CmpIPredicate::slt, kTimesB, loopBound);
     auto ifB1 = builder.create<scf::IfOp>(loc, cond1, false);
     Block *then1 = &ifB1.getThenRegion().front();
 
@@ -648,6 +718,9 @@ private:
       builder.setInsertionPointToStart(then1);
       emitBranchHalf(outerIV, then1, false, 0);
     } else {
+      // Partial last mini-batch: only tiles with index < N are valid (N =
+      // originalUB). Without this guard, k*B+b can be >= N → OOB / illegal
+      // addresses on device.
       builder.setInsertionPointToStart(then1);
       auto bFor1 = builder.create<scf::ForOp>(loc, c0, cB, c1);
       Block *b1Body = bFor1.getBody();
@@ -655,7 +728,11 @@ private:
       Value t1 = builder.create<arith::AddIOp>(
           loc, builder.create<arith::MulIOp>(loc, outerIV, cB),
           bFor1.getInductionVar());
-      emitBranchHalf(t1, b1Body, true, 0);
+      Value tileOk1 = builder.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::slt, t1, originalUB);
+      auto ifTile1 = builder.create<scf::IfOp>(loc, tileOk1, false);
+      Block *tile1Then = &ifTile1.getThenRegion().front();
+      emitBranchHalf(t1, tile1Then, true, 0);
     }
 
     // Branch2: if k > 0
@@ -683,7 +760,11 @@ private:
       builder.setInsertionPointToStart(b2Body);
       Value t2 = builder.create<arith::AddIOp>(
           loc, builder.create<arith::MulIOp>(loc, kMinus1, cB), bFor2.getInductionVar());
-      emitBranchHalf(t2, b2Body, true, half);
+      Value tileOk2 = builder.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::slt, t2, originalUB);
+      auto ifTile2 = builder.create<scf::IfOp>(loc, tileOk2, false);
+      Block *tile2Then = &ifTile2.getThenRegion().front();
+      emitBranchHalf(t2, tile2Then, true, half);
     }
 
     for (auto scopeOp : scopeOps_) {
@@ -1083,8 +1164,10 @@ public:
     if (lastCoreTypeAttr)
       endCoreType = lastCoreTypeAttr.getTcoretype();
 
-    // In two-branch mode (S=2 workspace) the pass bumps upper bound to N+1;
-    // otherwise the inner stage loop and linear flag chain are unchanged.
+    // Two-branch mode: outer upper bound → ceil(N/B)+1 (B=S/2, S from
+    // workspace leading dim).  When B=1 (S=2) this is N+1; when B>1 (S=4 etc.)
+    // a per-branch mini-batch scf.for over b∈[0,B) is generated.
+    // Fallback: inner stage loop with linear flag chain.
     SoftPipelineConverter converter(pipelineLoop_, scopeOps, workspaceValues_,
                                     numStages);
     bool changed = converter.convert();
