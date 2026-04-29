@@ -10,6 +10,7 @@ add_library(tilelangir_transforms STATIC
   InsertCVSync.cpp
   EnableMultiBuffer.cpp
   EnableSoftPipeline.cpp
+  EnableSoftLocalBuffer.cpp
   EnableLocalBuffer.cpp
   SplitMixKernel.cpp
   WrapHostFunction.cpp

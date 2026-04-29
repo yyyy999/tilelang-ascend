@@ -295,9 +295,10 @@ def lower(
             soft_pipeline = os.getenv("TILELANG_SOFT_PIPELINE", "0").lower() in ("1", "true", "yes")
         if soft_pipeline:
             pipeline.add(transforms.tilelangir.enable_soft_pipeline)
+            pipeline.add(transforms.tilelangir.enable_soft_local_buffer)
         else:
             pipeline.add(transforms.tilelangir.enable_multi_buffer)
-        pipeline.add(transforms.tilelangir.enable_local_buffer)
+            pipeline.add(transforms.tilelangir.enable_local_buffer)
         pipeline.add(transforms.tilelangir.specialize_cube)
         pipeline.add(transforms.bishengir.bind_workspace_arg)
         pipeline.add(transforms.tilelangir.plan_workspace_memory)

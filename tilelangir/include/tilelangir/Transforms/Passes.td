@@ -186,6 +186,26 @@ def TileLangIREnableLocalBuffer : Pass<"tilelangir-enable-local-buffer", "::mlir
   }];
 }
 
+def TileLangIREnableSoftLocalBuffer : Pass<"tilelangir-enable-soft-local-buffer", "::mlir::ModuleOp"> {
+  let summary = "TileLangIR Enable Soft Local Buffer pass";
+  let description = [{
+    A soft-pipeline aware variant of `tilelangir-enable-local-buffer`.
+
+    It is designed to work after `tilelangir-enable-soft-pipeline`, where
+    stage unrolling loops are replaced by `scf.if` dispatch.
+
+    Transformations:
+    1. Expand `memref::AllocOp` annotated with `hivm.multi_buffer` by
+       prepending a multi-buffer dimension.
+    2. Move those expanded allocs out of the innermost pipeline loop and the
+       immediately enclosing loop, so they live outside both loops.
+    3. For each use inside the soft-pipeline stage `scf.if` branch, compute
+       the correct slot index for the current pipeline iteration and rewrite
+       the operand to `memref.subview + memref.collapse_shape`, restoring the
+       original (non-expanded) view type.
+  }];
+}
+
 def TileLangIRSplitMixKernel : Pass<"tilelangir-split-mix-kernel", "::mlir::ModuleOp"> {
   let summary = "TileLangIR Split Mix Kernel pass";
   let description = [{
