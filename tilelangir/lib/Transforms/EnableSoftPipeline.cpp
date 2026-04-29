@@ -338,10 +338,6 @@ static void processLoop(scf::ForOp forOp, ArrayRef<Value> wsList,
   Value cG =
       b.create<arith::ConstantOp>(loc, iv.getType(),
                                   b.getIntegerAttr(iv.getType(), G));
-  Value slotI = b.create<arith::RemSIOp>(loc, iv, cG);
-  Value slotIdx = slotI;
-  if (!slotI.getType().isIndex())
-    slotIdx = b.create<arith::IndexCastOp>(loc, b.getIndexType(), slotI);
 
   LLVM_DEBUG(DBGS() << "Processing loop: " << scopes.size() << " scopes, G="
                     << G << ", " << perGroup << " scopes/group\n");
@@ -352,7 +348,19 @@ static void processLoop(scf::ForOp forOp, ArrayRef<Value> wsList,
     int group = i / perGroup;
     Value cond = condPerGroup[group];
 
+    // Stage g processes logical iteration (iv - g), so its workspace slot is:
+    //   slot = ((iv - g) + G) % G
+    // For G=2 and g=1 this is exactly the expected (iv - 1) % 2.
     b.setInsertionPoint(scopeOp);
+    Value gVal = b.create<arith::ConstantOp>(
+        loc, iv.getType(), b.getIntegerAttr(iv.getType(), group));
+    Value ivMinusG = b.create<arith::SubIOp>(loc, iv, gVal);
+    Value ivMinusGPlusMod = b.create<arith::AddIOp>(loc, ivMinusG, cG);
+    Value slotI = b.create<arith::RemSIOp>(loc, ivMinusGPlusMod, cG);
+    Value slotIdx = slotI;
+    if (!slotI.getType().isIndex())
+      slotIdx = b.create<arith::IndexCastOp>(loc, b.getIndexType(), slotI);
+
     auto ifOp = b.create<scf::IfOp>(loc, cond, /*withElseRegion=*/false);
 
     for (auto attr : scopeOp->getAttrs()) {
