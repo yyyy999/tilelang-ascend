@@ -139,6 +139,37 @@ def TileLangIREnableMultiBuffer : Pass<"tilelangir-enable-multi-buffer", "::mlir
   }];
 }
 
+def TileLangIREnableSoftPipeline : Pass<"tilelangir-enable-soft-pipeline", "::mlir::ModuleOp"> {
+  let summary = "TileLangIR Enable Soft Pipeline pass";
+  let description = [{
+    Transforms pipelined `scf.for` loops (carrying `tilelangir.num_stages`) into
+    soft-pipeline form: Cube/Vector scope bodies are dispatched with `scf.if`
+    on the same induction variable so hardware stages can overlap across
+    iterations. Workspace `memref_ext.alloc_workspace` ops marked with
+    `hivm.multi_buffer` are expanded by prepending one dimension whose size
+    equals `tilelangir.num_stages` (the same value as `hivm.multi_buffer` in
+    the intended pipeline); inner `memref.subview` uses of those buffers are
+    rewritten to index that slot (`iv % num_stages`).
+
+    This pass does **not** insert `sync_block_wait` / `sync_block_set`; those
+    belong to a separate pass (e.g. `tilelangir-insert-cv-sync`).
+
+    Steps:
+    1. Read a consistent `tilelangir.num_stages` (= G) from all marked inner loops.
+    2. Prepend a G-wide dimension to annotated workspace memrefs; drop the mark.
+    3. Raise the loop upper bound by `(G - 1) * step` (drain iterations).
+    4. Replace each `scope.scope` with `scf.if` guarded by
+       `lb + g*step <= iv < ub + g*step` for group index `g`.
+    5. Rewrite workspace subviews inside each `scf.if` to select slot `iv % G`.
+  }];
+  let options = [
+    Option<"verifySoftPipelineSync", "verify-soft-pipeline-sync", "bool",
+           /*default=*/"false",
+           "After the pass, verify that sync_block_set and sync_block_wait "
+           "counts match per flag index (constant SSA flags only; modulo 16).">,
+  ];
+}
+
 def TileLangIREnableLocalBuffer : Pass<"tilelangir-enable-local-buffer", "::mlir::ModuleOp"> {
   let summary = "TileLangIR Enable Local Buffer pass";
   let description = [{

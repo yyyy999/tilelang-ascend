@@ -236,6 +236,7 @@ def lower(
     runtime_only=False,
     enable_host_codegen=False,
     enable_device_compile=False,
+    soft_pipeline=None,
 ) -> CompiledArtifact:
     """
     enable_host_codegen: whether to enable host codegen, default is False, as we have our
@@ -290,7 +291,12 @@ def lower(
         pipeline.add(transforms.tilelangir.cv_split)
         pipeline.add(transforms.tilelangir.infer_mem_scope)
         pipeline.add(transforms.tilelangir.merge_copy_chains)
-        pipeline.add(transforms.tilelangir.enable_multi_buffer)
+        if soft_pipeline is None:
+            soft_pipeline = os.getenv("TILELANG_SOFT_PIPELINE", "0").lower() in ("1", "true", "yes")
+        if soft_pipeline:
+            pipeline.add(transforms.tilelangir.enable_soft_pipeline)
+        else:
+            pipeline.add(transforms.tilelangir.enable_multi_buffer)
         pipeline.add(transforms.tilelangir.enable_local_buffer)
         pipeline.add(transforms.tilelangir.specialize_cube)
         pipeline.add(transforms.bishengir.bind_workspace_arg)
