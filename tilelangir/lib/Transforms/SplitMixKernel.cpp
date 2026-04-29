@@ -76,7 +76,22 @@ static bool shouldDeleteComputationOp(Operation *op, bool isAIC) {
     return false;
   }
 
-  // 2. 处理具体的计算指令 (HIVM 指令等)
+  // 2. 处理 scf.if 分支（软流水后的结构）
+  if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    if (auto attr = ifOp->getAttrOfType<TCoreTypeAttr>("hivm.tcore_type")) {
+      if (isAIC) {
+        // AIC: 保留 CUBE，删除 VECTOR
+        return attr.getTcoretype() == TCoreType::VECTOR;
+      } else {
+        // AIV: 保留 VECTOR，删除 CUBE
+        return attr.getTcoretype() == TCoreType::CUBE;
+      }
+    }
+    // 没有标签的 if 保留
+    return false;
+  }
+
+  // 3. 处理具体的计算指令 (HIVM 指令等)
   // 原则：如果指令的操作数包含不该出现的 Memory Space，则删除该指令
   for (Value operand : op->getOperands()) {
     if (auto memRefType = operand.getType().dyn_cast<MemRefType>()) {
@@ -145,12 +160,20 @@ static void filterOpsRobust(func::FuncOp func, bool isAIC) {
   } while (changed); // 循环直到这一轮没有删除任何节点
 }
 
-// 移除保留循环上的 tcore_type 属性
+// 移除保留循环/if上的 tcore_type 属性
 static void stripLoopAttributes(func::FuncOp func, TCoreType targetType) {
   func.walk([&](scf::ForOp forOp) {
     if (auto attr = forOp->getAttrOfType<TCoreTypeAttr>("hivm.tcore_type")) {
       if (attr.getTcoretype() == targetType) {
         forOp->removeAttr("hivm.tcore_type");
+      }
+    }
+  });
+
+  func.walk([&](scf::IfOp ifOp) {
+    if (auto attr = ifOp->getAttrOfType<TCoreTypeAttr>("hivm.tcore_type")) {
+      if (attr.getTcoretype() == targetType) {
+        ifOp->removeAttr("hivm.tcore_type");
       }
     }
   });
