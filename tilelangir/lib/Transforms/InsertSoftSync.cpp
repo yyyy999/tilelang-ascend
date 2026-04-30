@@ -135,21 +135,32 @@ static bool isReadOperation(Operation *op) {
   return false;
 }
 
+static Value getRootBuffer(Value val) {
+  while (auto subviewOp = val.getDefiningOp<memref::SubViewOp>()) {
+    val = subviewOp.getSource();
+  }
+  while (auto collapseOp = val.getDefiningOp<memref::CollapseShapeOp>()) {
+    val = collapseOp.getViewSource();
+  }
+  while (auto reinterpretOp = val.getDefiningOp<memref::ReinterpretCastOp>()) {
+    val = reinterpretOp.getViewSource();
+  }
+  return val;
+}
+
 static bool isCommunicationBuffer(Value val) {
-  auto memrefType = val.getType().dyn_cast<MemRefType>();
+  Value rootVal = getRootBuffer(val);
+  auto memrefType = rootVal.getType().dyn_cast<MemRefType>();
   if (!memrefType)
     return false;
 
-  auto addrSpace = hivm::getOptionalHIVMAddressSpace(memrefType);
-  if (addrSpace.has_value()) {
-    if (*addrSpace == hivm::AddressSpace::GM) {
-      return true;
-    }
-  }
-
   if (memrefType.getShape().size() >= 1 && memrefType.getShape()[0] >= 2) {
-    if (addrSpace.has_value() && *addrSpace == hivm::AddressSpace::UB) {
-      return true;
+    auto addrSpace = hivm::getOptionalHIVMAddressSpace(memrefType);
+    if (addrSpace.has_value()) {
+      if (*addrSpace == hivm::AddressSpace::GM ||
+          *addrSpace == hivm::AddressSpace::UB) {
+        return true;
+      }
     }
   }
 
@@ -244,22 +255,24 @@ TileLangIRInsertSoftSync::collectCommunicationBuffers(scf::ForOp pipelineFor) {
   for (scf::IfOp stageIf : stageIfOps) {
     stageIf.thenBlock()->walk([&](Operation *op) {
       for (Value operand : op->getOperands()) {
-        if (isCommunicationBuffer(operand) && !seenBuffers.count(operand)) {
-          seenBuffers.insert(operand);
+        Value rootBuffer = getRootBuffer(operand);
+        if (isCommunicationBuffer(rootBuffer) && !seenBuffers.count(rootBuffer)) {
+          seenBuffers.insert(rootBuffer);
           CommunicationBuffer cb;
-          cb.buffer = operand;
-          cb.multiBufferDepth = getMultiBufferDepth(operand);
+          cb.buffer = rootBuffer;
+          cb.multiBufferDepth = getMultiBufferDepth(rootBuffer);
           cb.flagBase = nextFlagBase;
           nextFlagBase += cb.multiBufferDepth * 2;
           buffers.push_back(cb);
         }
       }
       for (Value result : op->getResults()) {
-        if (isCommunicationBuffer(result) && !seenBuffers.count(result)) {
-          seenBuffers.insert(result);
+        Value rootBuffer = getRootBuffer(result);
+        if (isCommunicationBuffer(rootBuffer) && !seenBuffers.count(rootBuffer)) {
+          seenBuffers.insert(rootBuffer);
           CommunicationBuffer cb;
-          cb.buffer = result;
-          cb.multiBufferDepth = getMultiBufferDepth(result);
+          cb.buffer = rootBuffer;
+          cb.multiBufferDepth = getMultiBufferDepth(rootBuffer);
           cb.flagBase = nextFlagBase;
           nextFlagBase += cb.multiBufferDepth * 2;
           buffers.push_back(cb);
@@ -293,12 +306,10 @@ void TileLangIRInsertSoftSync::buildProducerConsumerPairs(
       Value slotIndex;
 
       for (Value operand : op->getOperands()) {
-        if (operand == cb.buffer) {
+        Value rootBuffer = getRootBuffer(operand);
+        if (rootBuffer == cb.buffer) {
           isReadFromBuffer = true;
-        }
-        if (auto subviewOp = operand.getDefiningOp<memref::SubViewOp>()) {
-          if (subviewOp.getSource() == cb.buffer) {
-            isReadFromBuffer = true;
+          if (auto subviewOp = operand.getDefiningOp<memref::SubViewOp>()) {
             if (subviewOp.getMixedOffsets().size() > 0) {
               auto firstOffset = subviewOp.getMixedOffsets()[0];
               if (auto offsetVal = firstOffset.dyn_cast<Value>()) {
@@ -310,23 +321,19 @@ void TileLangIRInsertSoftSync::buildProducerConsumerPairs(
       }
 
       for (Value result : op->getResults()) {
-        if (result == cb.buffer) {
+        Value rootBuffer = getRootBuffer(result);
+        if (rootBuffer == cb.buffer) {
           isWriteToBuffer = true;
-        }
-        for (auto &use : result.getUses()) {
-          if (auto subviewOp = dyn_cast<memref::SubViewOp>(use.getOwner())) {
-            if (subviewOp.getResult() == cb.buffer) {
-              isWriteToBuffer = true;
-            }
-          }
         }
       }
 
       if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
-        if (auto subviewOp =
-                copyOp.getSource().getDefiningOp<memref::SubViewOp>()) {
-          if (subviewOp.getSource() == cb.buffer) {
-            isReadFromBuffer = true;
+        Value srcRoot = getRootBuffer(copyOp.getSource());
+        Value dstRoot = getRootBuffer(copyOp.getTarget());
+        
+        if (srcRoot == cb.buffer) {
+          isReadFromBuffer = true;
+          if (auto subviewOp = copyOp.getSource().getDefiningOp<memref::SubViewOp>()) {
             if (subviewOp.getMixedOffsets().size() > 0) {
               auto firstOffset = subviewOp.getMixedOffsets()[0];
               if (auto offsetVal = firstOffset.dyn_cast<Value>()) {
@@ -335,10 +342,9 @@ void TileLangIRInsertSoftSync::buildProducerConsumerPairs(
             }
           }
         }
-        if (auto subviewOp =
-                copyOp.getTarget().getDefiningOp<memref::SubViewOp>()) {
-          if (subviewOp.getSource() == cb.buffer) {
-            isWriteToBuffer = true;
+        if (dstRoot == cb.buffer) {
+          isWriteToBuffer = true;
+          if (auto subviewOp = copyOp.getTarget().getDefiningOp<memref::SubViewOp>()) {
             if (subviewOp.getMixedOffsets().size() > 0) {
               auto firstOffset = subviewOp.getMixedOffsets()[0];
               if (auto offsetVal = firstOffset.dyn_cast<Value>()) {
@@ -377,13 +383,18 @@ void TileLangIRInsertSoftSync::buildProducerConsumerPairs(
     stageOrder++;
   }
 
+  DenseSet<Operation *> matchedReads;
   for (auto &write : writes) {
     for (auto &read : reads) {
-      if (read.stageOrder > write.stageOrder) {
+      if (matchedReads.count(read.accessOp))
+        continue;
+      if (read.stageOrder > write.stageOrder &&
+          read.coreType != write.coreType) {
         ProducerConsumerPair pair;
         pair.producer = write;
         pair.consumer = read;
         cb.pairs.push_back(pair);
+        matchedReads.insert(read.accessOp);
         break;
       }
     }
