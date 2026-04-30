@@ -109,9 +109,6 @@ static bool isWriteOperation(Operation *op) {
   if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
     return true;
   }
-  if (op->hasTrait<OpTrait::MemWrite>()) {
-    return true;
-  }
   for (unsigned i = 0; i < op->getNumResults(); ++i) {
     auto resultType = op->getResult(i).getType();
     if (auto memrefType = resultType.dyn_cast<MemRefType>()) {
@@ -130,9 +127,6 @@ static bool isReadOperation(Operation *op) {
   if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
     return true;
   }
-  if (op->hasTrait<OpTrait::MemRead>()) {
-    return true;
-  }
   for (Value operand : op->getOperands()) {
     if (operand.getType().isa<MemRefType>()) {
       return true;
@@ -146,20 +140,16 @@ static bool isCommunicationBuffer(Value val) {
   if (!memrefType)
     return false;
 
-  if (auto spaceAttr =
-          memrefType.getMemorySpace().dyn_cast_or_null<hivm::AddressSpaceAttr>()) {
-    auto space = spaceAttr.getValue();
-    if (space == hivm::AddressSpace::gm) {
+  auto addrSpace = hivm::getOptionalHIVMAddressSpace(memrefType);
+  if (addrSpace.has_value()) {
+    if (*addrSpace == hivm::AddressSpace::GM) {
       return true;
     }
   }
 
   if (memrefType.getShape().size() >= 1 && memrefType.getShape()[0] >= 2) {
-    if (auto spaceAttr = memrefType.getMemorySpace()
-                             .dyn_cast_or_null<hivm::AddressSpaceAttr>()) {
-      if (spaceAttr.getValue() == hivm::AddressSpace::ub) {
-        return true;
-      }
+    if (addrSpace.has_value() && *addrSpace == hivm::AddressSpace::UB) {
+      return true;
     }
   }
 
