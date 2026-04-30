@@ -8,6 +8,7 @@ add_library(tilelangir_transforms STATIC
   SpecializeCube.cpp
   Vectorize.cpp
   InsertCVSync.cpp
+  InsertSoftSync.cpp
   EnableMultiBuffer.cpp
   EnableSoftPipeline.cpp
   EnableSoftLocalBuffer.cpp
