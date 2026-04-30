@@ -32,26 +32,21 @@ namespace {
 
 static constexpr size_t SYNC_FLAGS_LIMIT = 16;
 
-struct BufferAccessInfo {
-  Value buffer;
-  Operation *accessOp;
+struct StageInfo {
   scf::IfOp stageIf;
   hivm::TCoreType coreType;
-  bool isWrite;
-  Value slotIndex;
   int stageOrder;
+  Value slotIndex;
 };
 
-struct ProducerConsumerPair {
-  BufferAccessInfo producer;
-  BufferAccessInfo consumer;
-};
-
-struct CommunicationBuffer {
+struct BufferSyncInfo {
   Value buffer;
   size_t multiBufferDepth;
   size_t flagBase;
-  SmallVector<ProducerConsumerPair> pairs;
+  StageInfo producerStage;
+  StageInfo consumerStage;
+  bool hasProducer = false;
+  bool hasConsumer = false;
 };
 
 static Value convertToI64(OpBuilder &builder, Location loc, Value val) {
@@ -63,76 +58,6 @@ static Value convertToI64(OpBuilder &builder, Location loc, Value val) {
   if (type.isInteger())
     return builder.create<arith::ExtSIOp>(loc, builder.getI64Type(), val);
   llvm_unreachable("Unsupported type for conversion to i64");
-}
-
-static std::optional<int64_t> getConstantIntValue(Value value) {
-  if (auto constOp = value.getDefiningOp<arith::ConstantOp>()) {
-    if (auto intAttr = constOp.getValue().dyn_cast_or_null<IntegerAttr>())
-      return intAttr.getInt();
-  }
-  return std::nullopt;
-}
-
-static void buildSyncBlockSet(OpBuilder &builder, Location loc,
-                              hivm::TCoreType coreType, Value flagId) {
-  auto coreTypeAttr =
-      mlir::hivm::TCoreTypeAttr::get(builder.getContext(), coreType);
-  auto syncMode = hivm::SyncBlockInstrModeAttr::get(
-      builder.getContext(),
-      hivm::SyncBlockInstrMode::INTRA_BLOCK_SYNCHRONIZATION);
-  auto tPipTypeAttr =
-      hivm::PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_S);
-  auto pipTypeAttr = hivm::PipeAttr::get(
-      builder.getContext(),
-      coreType == hivm::TCoreType::VECTOR ? hivm::PIPE::PIPE_MTE3
-                                          : hivm::PIPE::PIPE_FIX);
-
-  builder.create<hivm::SyncBlockSetOp>(loc, coreTypeAttr, pipTypeAttr,
-                                       tPipTypeAttr, flagId, Value(),
-                                       syncMode);
-}
-
-static void buildSyncBlockWait(OpBuilder &builder, Location loc,
-                               hivm::TCoreType coreType, Value flagId) {
-  auto coreTypeAttr =
-      mlir::hivm::TCoreTypeAttr::get(builder.getContext(), coreType);
-  auto tPipTypeAttr =
-      hivm::PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_S);
-  auto pipTypeAttr =
-      hivm::PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_MTE2);
-
-  builder.create<hivm::SyncBlockWaitOp>(loc, coreTypeAttr, tPipTypeAttr,
-                                        pipTypeAttr, flagId);
-}
-
-static bool isWriteOperation(Operation *op) {
-  if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
-    return true;
-  }
-  for (unsigned i = 0; i < op->getNumResults(); ++i) {
-    auto resultType = op->getResult(i).getType();
-    if (auto memrefType = resultType.dyn_cast<MemRefType>()) {
-      return true;
-    }
-  }
-  StringRef opName = op->getName().getStringRef();
-  if (opName.contains("fixpipe") || opName.contains("copy") ||
-      opName.contains("vbrc") || opName.contains("vcast")) {
-    return true;
-  }
-  return false;
-}
-
-static bool isReadOperation(Operation *op) {
-  if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
-    return true;
-  }
-  for (Value operand : op->getOperands()) {
-    if (operand.getType().isa<MemRefType>()) {
-      return true;
-    }
-  }
-  return false;
 }
 
 static Value getRootBuffer(Value val) {
@@ -178,6 +103,50 @@ static size_t getMultiBufferDepth(Value buffer) {
   return 1;
 }
 
+static Value extractSlotIndexFromSubview(Value val) {
+  if (auto subviewOp = val.getDefiningOp<memref::SubViewOp>()) {
+    if (subviewOp.getMixedOffsets().size() > 0) {
+      auto firstOffset = subviewOp.getMixedOffsets()[0];
+      if (auto offsetVal = firstOffset.dyn_cast<Value>()) {
+        return offsetVal;
+      }
+    }
+  }
+  return Value();
+}
+
+static void buildSyncBlockSet(OpBuilder &builder, Location loc,
+                              hivm::TCoreType coreType, Value flagId) {
+  auto coreTypeAttr =
+      mlir::hivm::TCoreTypeAttr::get(builder.getContext(), coreType);
+  auto syncMode = hivm::SyncBlockInstrModeAttr::get(
+      builder.getContext(),
+      hivm::SyncBlockInstrMode::INTRA_BLOCK_SYNCHRONIZATION);
+  auto tPipTypeAttr =
+      hivm::PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_S);
+  auto pipTypeAttr = hivm::PipeAttr::get(
+      builder.getContext(),
+      coreType == hivm::TCoreType::VECTOR ? hivm::PIPE::PIPE_MTE3
+                                          : hivm::PIPE::PIPE_FIX);
+
+  builder.create<hivm::SyncBlockSetOp>(loc, coreTypeAttr, pipTypeAttr,
+                                       tPipTypeAttr, flagId, Value(),
+                                       syncMode);
+}
+
+static void buildSyncBlockWait(OpBuilder &builder, Location loc,
+                               hivm::TCoreType coreType, Value flagId) {
+  auto coreTypeAttr =
+      mlir::hivm::TCoreTypeAttr::get(builder.getContext(), coreType);
+  auto tPipTypeAttr =
+      hivm::PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_S);
+  auto pipTypeAttr =
+      hivm::PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_MTE2);
+
+  builder.create<hivm::SyncBlockWaitOp>(loc, coreTypeAttr, tPipTypeAttr,
+                                        pipTypeAttr, flagId);
+}
+
 static SmallVector<scf::IfOp> collectStageIfOps(scf::ForOp pipelineFor) {
   SmallVector<scf::IfOp> stageIfOps;
   for (Operation &op : pipelineFor.getBody()->getOperations()) {
@@ -198,12 +167,9 @@ private:
   size_t nextFlagBase = 0;
 
   SmallVector<scf::ForOp> findPipelineLoops(ModuleOp module);
-  SmallVector<CommunicationBuffer>
-  collectCommunicationBuffers(scf::ForOp pipelineFor);
-  void buildProducerConsumerPairs(CommunicationBuffer &cb,
-                                   scf::ForOp pipelineFor);
-  void insertSynchronization(CommunicationBuffer &cb, scf::ForOp pipelineFor);
-  void insertInitAndCleanup(SmallVector<CommunicationBuffer> &buffers,
+  SmallVector<BufferSyncInfo> analyzePipelineBuffers(scf::ForOp pipelineFor);
+  void insertStageSync(BufferSyncInfo &bsi, scf::ForOp pipelineFor);
+  void insertInitAndCleanup(SmallVector<BufferSyncInfo> &buffers,
                             scf::ForOp pipelineFor);
 };
 
@@ -219,14 +185,10 @@ void TileLangIRInsertSoftSync::runOnOperation() {
   for (scf::ForOp pipelineFor : pipelineLoops) {
     nextFlagBase = 0;
 
-    auto buffers = collectCommunicationBuffers(pipelineFor);
+    auto buffers = analyzePipelineBuffers(pipelineFor);
 
     for (auto &buffer : buffers) {
-      buildProducerConsumerPairs(buffer, pipelineFor);
-    }
-
-    for (auto &buffer : buffers) {
-      insertSynchronization(buffer, pipelineFor);
+      insertStageSync(buffer, pipelineFor);
     }
 
     insertInitAndCleanup(buffers, pipelineFor);
@@ -246,50 +208,12 @@ TileLangIRInsertSoftSync::findPipelineLoops(ModuleOp module) {
   return pipelineLoops;
 }
 
-SmallVector<CommunicationBuffer>
-TileLangIRInsertSoftSync::collectCommunicationBuffers(scf::ForOp pipelineFor) {
-  SmallVector<CommunicationBuffer> buffers;
-  DenseSet<Value> seenBuffers;
+SmallVector<BufferSyncInfo>
+TileLangIRInsertSoftSync::analyzePipelineBuffers(scf::ForOp pipelineFor) {
+  SmallVector<BufferSyncInfo> bufferInfos;
+  DenseMap<Value, BufferSyncInfo> bufferMap;
 
   auto stageIfOps = collectStageIfOps(pipelineFor);
-  for (scf::IfOp stageIf : stageIfOps) {
-    stageIf.thenBlock()->walk([&](Operation *op) {
-      for (Value operand : op->getOperands()) {
-        Value rootBuffer = getRootBuffer(operand);
-        if (isCommunicationBuffer(rootBuffer) && !seenBuffers.count(rootBuffer)) {
-          seenBuffers.insert(rootBuffer);
-          CommunicationBuffer cb;
-          cb.buffer = rootBuffer;
-          cb.multiBufferDepth = getMultiBufferDepth(rootBuffer);
-          cb.flagBase = nextFlagBase;
-          nextFlagBase += cb.multiBufferDepth * 2;
-          buffers.push_back(cb);
-        }
-      }
-      for (Value result : op->getResults()) {
-        Value rootBuffer = getRootBuffer(result);
-        if (isCommunicationBuffer(rootBuffer) && !seenBuffers.count(rootBuffer)) {
-          seenBuffers.insert(rootBuffer);
-          CommunicationBuffer cb;
-          cb.buffer = rootBuffer;
-          cb.multiBufferDepth = getMultiBufferDepth(rootBuffer);
-          cb.flagBase = nextFlagBase;
-          nextFlagBase += cb.multiBufferDepth * 2;
-          buffers.push_back(cb);
-        }
-      }
-    });
-  }
-
-  return buffers;
-}
-
-void TileLangIRInsertSoftSync::buildProducerConsumerPairs(
-    CommunicationBuffer &cb, scf::ForOp pipelineFor) {
-  auto stageIfOps = collectStageIfOps(pipelineFor);
-
-  SmallVector<BufferAccessInfo> writes;
-  SmallVector<BufferAccessInfo> reads;
 
   int stageOrder = 0;
   for (scf::IfOp stageIf : stageIfOps) {
@@ -300,225 +224,196 @@ void TileLangIRInsertSoftSync::buildProducerConsumerPairs(
 
     auto coreType = coreTypeAttr.getTcoretype();
 
+    bool isWriteToBuffer = false;
+    bool isReadFromBuffer = false;
+    Value buffer;
+    Value slotIndex;
+
     stageIf.thenBlock()->walk([&](Operation *op) {
-      bool isWriteToBuffer = false;
-      bool isReadFromBuffer = false;
-      Value slotIndex;
-
-      for (Value operand : op->getOperands()) {
-        Value rootBuffer = getRootBuffer(operand);
-        if (rootBuffer == cb.buffer) {
-          isReadFromBuffer = true;
-          if (auto subviewOp = operand.getDefiningOp<memref::SubViewOp>()) {
-            if (subviewOp.getMixedOffsets().size() > 0) {
-              auto firstOffset = subviewOp.getMixedOffsets()[0];
-              if (auto offsetVal = firstOffset.dyn_cast<Value>()) {
-                slotIndex = offsetVal;
-              }
-            }
-          }
-        }
-      }
-
-      for (Value result : op->getResults()) {
-        Value rootBuffer = getRootBuffer(result);
-        if (rootBuffer == cb.buffer) {
-          isWriteToBuffer = true;
-        }
-      }
-
       if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
         Value srcRoot = getRootBuffer(copyOp.getSource());
         Value dstRoot = getRootBuffer(copyOp.getTarget());
-        
-        if (srcRoot == cb.buffer) {
-          isReadFromBuffer = true;
-          if (auto subviewOp = copyOp.getSource().getDefiningOp<memref::SubViewOp>()) {
-            if (subviewOp.getMixedOffsets().size() > 0) {
-              auto firstOffset = subviewOp.getMixedOffsets()[0];
-              if (auto offsetVal = firstOffset.dyn_cast<Value>()) {
-                slotIndex = offsetVal;
-              }
-            }
-          }
-        }
-        if (dstRoot == cb.buffer) {
+
+        if (isCommunicationBuffer(dstRoot)) {
           isWriteToBuffer = true;
-          if (auto subviewOp = copyOp.getTarget().getDefiningOp<memref::SubViewOp>()) {
-            if (subviewOp.getMixedOffsets().size() > 0) {
-              auto firstOffset = subviewOp.getMixedOffsets()[0];
-              if (auto offsetVal = firstOffset.dyn_cast<Value>()) {
-                slotIndex = offsetVal;
-              }
-            }
+          buffer = dstRoot;
+          slotIndex = extractSlotIndexFromSubview(copyOp.getTarget());
+        }
+        if (isCommunicationBuffer(srcRoot)) {
+          isReadFromBuffer = true;
+          buffer = srcRoot;
+          slotIndex = extractSlotIndexFromSubview(copyOp.getSource());
+        }
+      }
+
+      if (op->getName().getStringRef().contains("fixpipe")) {
+        for (Value operand : op->getOperands()) {
+          Value root = getRootBuffer(operand);
+          if (isCommunicationBuffer(root)) {
+            isWriteToBuffer = true;
+            buffer = root;
+            slotIndex = extractSlotIndexFromSubview(operand);
+            break;
           }
         }
       }
 
+      if (op->getName().getStringRef().contains("nd2nz")) {
+        for (Value result : op->getResults()) {
+          for (auto &use : result.getUses()) {
+            if (auto subviewOp = dyn_cast<memref::SubViewOp>(use.getOwner())) {
+              for (Value operand : subviewOp->getOperands()) {
+                if (operand == result) {
+                  Value root = getRootBuffer(subviewOp.getResult());
+                  if (isCommunicationBuffer(root)) {
+                    isReadFromBuffer = true;
+                    buffer = root;
+                    slotIndex = extractSlotIndexFromSubview(subviewOp.getResult());
+                  }
+                }
+              }
+            }
+          }
+        }
+        for (Value operand : op->getOperands()) {
+          Value root = getRootBuffer(operand);
+          if (isCommunicationBuffer(root)) {
+            isReadFromBuffer = true;
+            buffer = root;
+            slotIndex = extractSlotIndexFromSubview(operand);
+            break;
+          }
+        }
+      }
+    });
+
+    if (buffer) {
+      if (!bufferMap.count(buffer)) {
+        BufferSyncInfo bsi;
+        bsi.buffer = buffer;
+        bsi.multiBufferDepth = getMultiBufferDepth(buffer);
+        bsi.flagBase = nextFlagBase;
+        nextFlagBase += bsi.multiBufferDepth * 2;
+        bufferMap[buffer] = bsi;
+      }
+
+      BufferSyncInfo &bsi = bufferMap[buffer];
+
       if (isWriteToBuffer) {
-        BufferAccessInfo info;
-        info.buffer = cb.buffer;
-        info.accessOp = op;
-        info.stageIf = stageIf;
-        info.coreType = coreType;
-        info.isWrite = true;
-        info.slotIndex = slotIndex;
-        info.stageOrder = stageOrder;
-        writes.push_back(info);
+        StageInfo si;
+        si.stageIf = stageIf;
+        si.coreType = coreType;
+        si.stageOrder = stageOrder;
+        si.slotIndex = slotIndex;
+        bsi.producerStage = si;
+        bsi.hasProducer = true;
       }
 
       if (isReadFromBuffer && !isWriteToBuffer) {
-        BufferAccessInfo info;
-        info.buffer = cb.buffer;
-        info.accessOp = op;
-        info.stageIf = stageIf;
-        info.coreType = coreType;
-        info.isWrite = false;
-        info.slotIndex = slotIndex;
-        info.stageOrder = stageOrder;
-        reads.push_back(info);
+        StageInfo si;
+        si.stageIf = stageIf;
+        si.coreType = coreType;
+        si.stageOrder = stageOrder;
+        si.slotIndex = slotIndex;
+        bsi.consumerStage = si;
+        bsi.hasConsumer = true;
       }
-    });
+    }
 
     stageOrder++;
   }
 
-  DenseSet<Operation *> matchedReads;
-  for (auto &write : writes) {
-    for (auto &read : reads) {
-      if (matchedReads.count(read.accessOp))
-        continue;
-      if (read.stageOrder > write.stageOrder &&
-          read.coreType != write.coreType) {
-        ProducerConsumerPair pair;
-        pair.producer = write;
-        pair.consumer = read;
-        cb.pairs.push_back(pair);
-        matchedReads.insert(read.accessOp);
-        break;
-      }
+  for (auto &[val, bsi] : bufferMap) {
+    if (bsi.hasProducer && bsi.hasConsumer &&
+        bsi.producerStage.coreType != bsi.consumerStage.coreType) {
+      bufferInfos.push_back(bsi);
     }
   }
+
+  return bufferInfos;
 }
 
-void TileLangIRInsertSoftSync::insertSynchronization(CommunicationBuffer &cb,
-                                                      scf::ForOp pipelineFor) {
+void TileLangIRInsertSoftSync::insertStageSync(BufferSyncInfo &bsi,
+                                                scf::ForOp pipelineFor) {
+  if (!bsi.hasProducer || !bsi.hasConsumer)
+    return;
+
   OpBuilder builder(pipelineFor->getContext());
   Location loc = pipelineFor.getLoc();
 
-  for (auto &pair : cb.pairs) {
-    auto &producer = pair.producer;
-    auto &consumer = pair.consumer;
-
-    Value slotIndex = producer.slotIndex ? producer.slotIndex : consumer.slotIndex;
-    if (!slotIndex) {
-      LLVM_DEBUG(llvm::dbgs() << "No slot index found for buffer\n");
-      continue;
-    }
-
-    {
-      builder.setInsertionPoint(producer.accessOp);
-      Value slotIndexI64 = convertToI64(builder, loc, slotIndex);
-
-      Value readyFlagBase = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(cb.flagBase));
-      Value freeFlagBase = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(cb.flagBase + cb.multiBufferDepth));
-
-      Value freeFlag = builder.create<arith::AddIOp>(loc, freeFlagBase, slotIndexI64);
-
-      Value syncLimit = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
-      freeFlag = builder.create<arith::RemSIOp>(loc, freeFlag, syncLimit);
-
-      buildSyncBlockWait(builder, loc, producer.coreType, freeFlag);
-    }
-
-    {
-      builder.setInsertionPointAfter(producer.accessOp);
-      Value slotIndexI64 = convertToI64(builder, loc, slotIndex);
-
-      Value readyFlagBase = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(cb.flagBase));
-
-      Value readyFlag = builder.create<arith::AddIOp>(loc, readyFlagBase, slotIndexI64);
-
-      Value syncLimit = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
-      readyFlag = builder.create<arith::RemSIOp>(loc, readyFlag, syncLimit);
-
-      buildSyncBlockSet(builder, loc, producer.coreType, readyFlag);
-    }
-
-    {
-      builder.setInsertionPoint(consumer.accessOp);
-      Value slotIndexI64 = convertToI64(builder, loc, slotIndex);
-
-      Value readyFlagBase = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(cb.flagBase));
-
-      Value readyFlag = builder.create<arith::AddIOp>(loc, readyFlagBase, slotIndexI64);
-
-      Value syncLimit = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
-      readyFlag = builder.create<arith::RemSIOp>(loc, readyFlag, syncLimit);
-
-      buildSyncBlockWait(builder, loc, consumer.coreType, readyFlag);
-    }
-
-    {
-      builder.setInsertionPointAfter(consumer.accessOp);
-      Value slotIndexI64 = convertToI64(builder, loc, slotIndex);
-
-      Value freeFlagBase = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(cb.flagBase + cb.multiBufferDepth));
-
-      Value freeFlag = builder.create<arith::AddIOp>(loc, freeFlagBase, slotIndexI64);
-
-      Value syncLimit = builder.create<arith::ConstantOp>(
-          loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
-      freeFlag = builder.create<arith::RemSIOp>(loc, freeFlag, syncLimit);
-
-      buildSyncBlockSet(builder, loc, consumer.coreType, freeFlag);
-    }
+  Value slotIndex = bsi.producerStage.slotIndex
+                        ? bsi.producerStage.slotIndex
+                        : bsi.consumerStage.slotIndex;
+  if (!slotIndex) {
+    LLVM_DEBUG(llvm::dbgs() << "No slot index found for buffer\n");
+    return;
   }
+
+  auto insertSyncAtStageStart = [&](scf::IfOp stageIf, hivm::TCoreType coreType,
+                                    Value flagId) {
+    builder.setInsertionPointToStart(stageIf.thenBlock());
+    buildSyncBlockWait(builder, loc, coreType, flagId);
+  };
+
+  auto insertSyncAtStageEnd = [&](scf::IfOp stageIf, hivm::TCoreType coreType,
+                                  Value flagId) {
+    Block *thenBlock = stageIf.thenBlock();
+    builder.setInsertionPoint(thenBlock->getTerminator());
+    buildSyncBlockSet(builder, loc, coreType, flagId);
+  };
+
+  auto createFlagValue = [&](size_t base, Value slot) -> Value {
+    Value slotI64 = convertToI64(builder, loc, slot);
+    Value flagBase = builder.create<arith::ConstantOp>(
+        loc, builder.getI64Type(), builder.getI64IntegerAttr(base));
+    Value flag = builder.create<arith::AddIOp>(loc, flagBase, slotI64);
+    Value syncLimit = builder.create<arith::ConstantOp>(
+        loc, builder.getI64Type(),
+        builder.getI64IntegerAttr(SYNC_FLAGS_LIMIT));
+    return builder.create<arith::RemSIOp>(loc, flag, syncLimit);
+  };
+
+  Value freeFlag = createFlagValue(bsi.flagBase + bsi.multiBufferDepth, slotIndex);
+  Value readyFlag = createFlagValue(bsi.flagBase, slotIndex);
+
+  insertSyncAtStageStart(bsi.producerStage.stageIf, bsi.producerStage.coreType,
+                         freeFlag);
+
+  freeFlag = createFlagValue(bsi.flagBase + bsi.multiBufferDepth, slotIndex);
+  readyFlag = createFlagValue(bsi.flagBase, slotIndex);
+
+  insertSyncAtStageEnd(bsi.producerStage.stageIf, bsi.producerStage.coreType,
+                       readyFlag);
+
+  readyFlag = createFlagValue(bsi.flagBase, slotIndex);
+
+  insertSyncAtStageStart(bsi.consumerStage.stageIf, bsi.consumerStage.coreType,
+                         readyFlag);
+
+  freeFlag = createFlagValue(bsi.flagBase + bsi.multiBufferDepth, slotIndex);
+
+  insertSyncAtStageEnd(bsi.consumerStage.stageIf, bsi.consumerStage.coreType,
+                       freeFlag);
 }
 
 void TileLangIRInsertSoftSync::insertInitAndCleanup(
-    SmallVector<CommunicationBuffer> &buffers, scf::ForOp pipelineFor) {
+    SmallVector<BufferSyncInfo> &buffers, scf::ForOp pipelineFor) {
   if (buffers.empty())
     return;
 
   OpBuilder builder(pipelineFor->getContext());
   Location loc = pipelineFor.getLoc();
 
-  auto numStagesAttr = pipelineFor->getAttr("tilelangir.num_stages");
-  if (!numStagesAttr) {
-    pipelineFor.emitError("Missing tilelangir.num_stages attribute");
-    return;
-  }
-
-  int64_t numStages = numStagesAttr.cast<IntegerAttr>().getInt();
-
   builder.setInsertionPoint(pipelineFor);
 
-  for (auto &cb : buffers) {
-    for (size_t slot = 0; slot < cb.multiBufferDepth; ++slot) {
+  for (auto &bsi : buffers) {
+    for (size_t slot = 0; slot < bsi.multiBufferDepth; ++slot) {
       Value slotVal = builder.create<arith::ConstantOp>(
           loc, builder.getI64Type(), builder.getI64IntegerAttr(slot));
 
       Value freeFlagBase = builder.create<arith::ConstantOp>(
           loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(cb.flagBase + cb.multiBufferDepth));
+          builder.getI64IntegerAttr(bsi.flagBase + bsi.multiBufferDepth));
       Value freeFlag = builder.create<arith::AddIOp>(loc, freeFlagBase, slotVal);
 
       Value syncLimit = builder.create<arith::ConstantOp>(
@@ -533,14 +428,14 @@ void TileLangIRInsertSoftSync::insertInitAndCleanup(
 
   builder.setInsertionPointAfter(pipelineFor);
 
-  for (auto &cb : buffers) {
-    for (size_t slot = 0; slot < cb.multiBufferDepth; ++slot) {
+  for (auto &bsi : buffers) {
+    for (size_t slot = 0; slot < bsi.multiBufferDepth; ++slot) {
       Value slotVal = builder.create<arith::ConstantOp>(
           loc, builder.getI64Type(), builder.getI64IntegerAttr(slot));
 
       Value freeFlagBase = builder.create<arith::ConstantOp>(
           loc, builder.getI64Type(),
-          builder.getI64IntegerAttr(cb.flagBase + cb.multiBufferDepth));
+          builder.getI64IntegerAttr(bsi.flagBase + bsi.multiBufferDepth));
       Value freeFlag = builder.create<arith::AddIOp>(loc, freeFlagBase, slotVal);
 
       Value syncLimit = builder.create<arith::ConstantOp>(
